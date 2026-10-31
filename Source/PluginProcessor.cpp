@@ -262,7 +262,7 @@ public:
             float yCurr = midY + (midY - topPoints[i]);
             float yPrev = midY + (midY - topPoints[i - 1]);
             float cX = (xCurr + xPrev) / 2.0f;
-            float cY = (yCurr + yPrev) / 2.0f;
+            float cY = (yPrev + yCurr) / 2.0f;
             path.quadraticTo (xCurr, yCurr, cX, cY);
         }
 
@@ -392,22 +392,22 @@ class FreesoundMiniEditor : public juce::AudioProcessorEditor,
 {
 public:
     explicit FreesoundMiniEditor (FreesoundMiniAudioProcessor& p)
-        : AudioProcessorEditor (&p), Thread ("FreesoundNetworkThread"), audioProcessor (p)
+        : AudioProcessorEditor (&p), Thread ("FreesoundNetworkThread"), proc (p)
     {
         setSize (360, 560);
 
-        if (audioProcessor.sampleDirectory == juce::File())
+        if (proc.sampleDirectory == juce::File())
         {
-            audioProcessor.sampleDirectory = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
-                                                .getChildFile ("FreesoundSamples");
+            proc.sampleDirectory = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
+                                        .getChildFile ("FreesoundSamples");
         }
-        audioProcessor.sampleDirectory.createDirectory();
+        proc.sampleDirectory.createDirectory();
 
         // API Bar
         tokenInput.setTextToShowWhenEmpty ("Enter API Key...", juce::Colours::grey);
-        tokenInput.setText (audioProcessor.savedToken, false);
+        tokenInput.setText (proc.savedToken, false);
         tokenInput.onTextChange = [this] { 
-            audioProcessor.savedToken = tokenInput.getText().trim(); 
+            proc.savedToken = tokenInput.getText().trim(); 
             updateAPIStatus();
         };
         addAndMakeVisible (tokenInput);
@@ -417,14 +417,14 @@ public:
 
         dirButton.onClick = [this] {
             fileChooser = std::make_unique<juce::FileChooser> ("Choose Sample Folder",
-                                                                audioProcessor.sampleDirectory,
+                                                                proc.sampleDirectory,
                                                                 "*");
             auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories;
             fileChooser->launchAsync (flags, [this] (const juce::FileChooser& fc) {
                 auto result = fc.getResult();
                 if (result.isDirectory())
                 {
-                    audioProcessor.sampleDirectory = result;
+                    proc.sampleDirectory = result;
                     statusLabel.setText ("Folder: " + result.getFileName(), juce::dontSendNotification);
                 }
             });
@@ -432,7 +432,7 @@ public:
         addAndMakeVisible (dirButton);
 
         openFolderButton.onClick = [this] {
-            audioProcessor.sampleDirectory.startAsProcess();
+            proc.sampleDirectory.startAsProcess();
         };
         addAndMakeVisible (openFolderButton);
 
@@ -456,14 +456,13 @@ public:
         };
         addAndMakeVisible (searchButton);
 
-        // Панель фильтров: Channels (All, Mono, Stereo)
+        // Фильтры
         channelBox.addItem ("All Ch", 1);
         channelBox.addItem ("Mono", 2);
         channelBox.addItem ("Stereo", 3);
         channelBox.setSelectedId (1, juce::dontSendNotification);
         addAndMakeVisible (channelBox);
 
-        // Панель фильтров: Duration Slider (от 0.5с до 60с)
         durationSlider.setRange (1.0, 60.0, 1.0);
         durationSlider.setValue (15.0);
         durationSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 18);
@@ -482,14 +481,13 @@ public:
         table.setMultipleSelectionAllowed (false);
         addAndMakeVisible (table);
 
-        // Волна
         addAndMakeVisible (waveformDisplay);
 
         // Транспорт
-        playButton.onClick = [this] { audioProcessor.updatePlaybackSettings(); };
+        playButton.onClick = [this] { proc.updatePlaybackSettings(); };
         addAndMakeVisible (playButton);
 
-        stopButton.onClick = [this] { audioProcessor.stopPreview(); };
+        stopButton.onClick = [this] { proc.stopPreview(); };
         addAndMakeVisible (stopButton);
 
         pitchSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
@@ -497,19 +495,19 @@ public:
         pitchSlider.setValue (0.0);
         pitchSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
         pitchSlider.setLookAndFeel (&knobLookAndFeel);
-        pitchSlider.onValueChange = [this] { audioProcessor.setPitchSemitones (pitchSlider.getValue()); };
+        pitchSlider.onValueChange = [this] { proc.setPitchSemitones (pitchSlider.getValue()); };
         addAndMakeVisible (pitchSlider);
 
         normCheckbox.setButtonText ("Norm -6dB");
         normCheckbox.setToggleState (true, juce::dontSendNotification);
-        normCheckbox.onClick = [this] { audioProcessor.setNormalization (normCheckbox.getToggleState()); };
+        normCheckbox.onClick = [this] { proc.setNormalization (normCheckbox.getToggleState()); };
         addAndMakeVisible (normCheckbox);
 
         volSlider.setSliderStyle (juce::Slider::LinearBar);
         volSlider.setRange (0.0, 1.0, 0.01);
         volSlider.setValue (0.8);
         volSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-        volSlider.onValueChange = [this] { audioProcessor.setGain ((float) volSlider.getValue()); };
+        volSlider.onValueChange = [this] { proc.setGain ((float) volSlider.getValue()); };
         addAndMakeVisible (volSlider);
 
         volLabel.setText ("Vol", juce::dontSendNotification);
@@ -539,7 +537,6 @@ public:
     {
         auto area = getLocalBounds().reduced (12);
 
-        // Верхний тулбар
         auto topBar = area.removeFromTop (26);
         infoButton.setBounds (topBar.removeFromRight (26));
         topBar.removeFromRight (4);
@@ -552,7 +549,6 @@ public:
 
         area.removeFromTop (6);
 
-        // Строка поиска
         auto searchRow = area.removeFromTop (28);
         searchButton.setBounds (searchRow.removeFromRight (55));
         searchRow.removeFromRight (4);
@@ -560,7 +556,6 @@ public:
 
         area.removeFromTop (6);
 
-        // Ряд фильтров: Длительность и Каналы
         auto filterRow = area.removeFromTop (24);
         channelBox.setBounds (filterRow.removeFromLeft (85));
         filterRow.removeFromLeft (8);
@@ -569,7 +564,6 @@ public:
 
         area.removeFromTop (8);
 
-        // Нижняя панель плеера
         auto bottomControl = area.removeFromBottom (46);
         area.removeFromBottom (6);
         waveformDisplay.setBounds (area.removeFromBottom (75));
@@ -691,7 +685,7 @@ public:
 private:
     void updateAPIStatus()
     {
-        if (audioProcessor.savedToken.length() > 5)
+        if (proc.savedToken.length() > 5)
         {
             apiStatusLabel.setText ("✔ API OK", juce::dontSendNotification);
             apiStatusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff52b788));
@@ -714,8 +708,8 @@ private:
 
         if (existing.existsAsFile())
         {
-            audioProcessor.loadPreviewFile (existing);
-            waveformDisplay.setBuffer (audioProcessor.getCachedBuffer());
+            proc.loadPreviewFile (existing);
+            waveformDisplay.setBuffer (proc.getCachedBuffer());
         }
         else
         {
@@ -728,4 +722,160 @@ private:
         auto token = tokenInput.getText().trim();
         if (token.isEmpty() || currentQuery.isEmpty()) return;
 
-        // Построение строки фильтра Freesound API
+        juce::String filterStr = "duration:[0.1 TO " + juce::String (durationSlider.getValue(), 1) + "]";
+        int chId = channelBox.getSelectedId();
+        if (chId == 2) filterStr += " channels:1";
+        else if (chId == 3) filterStr += " channels:2";
+
+        auto urlStr = "https://freesound.org/apiv2/search/text/?query="
+                    + juce::URL::addEscapeChars (currentQuery, true)
+                    + "&filter=" + juce::URL::addEscapeChars (filterStr, true)
+                    + "&token=" + token
+                    + "&fields=id,name,duration,previews&page_size=40";
+
+        juce::URL url (urlStr);
+        auto response = url.readEntireTextStream();
+
+        auto varJson = juce::JSON::parse (response);
+        if (auto* obj = varJson.getDynamicObject())
+        {
+            auto resultsVar = obj->getProperty ("results");
+            if (resultsVar.isArray())
+            {
+                auto* resultsArray = resultsVar.getArray();
+                std::vector<SoundResult> newResults;
+
+                for (auto& elem : *resultsArray)
+                {
+                    SoundResult r;
+                    r.id = static_cast<int> (elem["id"]);
+                    r.name = elem["name"].toString();
+                    r.duration = static_cast<double> (elem["duration"]);
+
+                    if (auto* prev = elem["previews"].getDynamicObject())
+                    {
+                        r.previewUrl = prev->getProperty ("preview-hq-mp3").toString();
+                        if (r.previewUrl.isEmpty())
+                            r.previewUrl = prev->getProperty ("preview-lq-mp3").toString();
+                    }
+
+                    auto sanitizedName = juce::File::createLegalFileName (r.name);
+                    auto target = proc.sampleDirectory.getChildFile (juce::String (r.id) + "_" + sanitizedName + ".mp3");
+                    if (target.existsAsFile())
+                        r.localFile = target;
+
+                    newResults.push_back (r);
+                }
+
+                juce::MessageManager::callAsync ([this, res = std::move (newResults)]() mutable {
+                    {
+                        const juce::ScopedLock sl (resultsLock);
+                        results = std::move (res);
+                    }
+                    table.updateContent();
+                    statusLabel.setText ("Found: " + juce::String (getNumRows()) + " sounds", juce::dontSendNotification);
+                });
+                return;
+            }
+        }
+
+        juce::MessageManager::callAsync ([this] {
+            statusLabel.setText ("Error: Check Token or Query", juce::dontSendNotification);
+        });
+    }
+
+    void downloadAndPlay (int index)
+    {
+        statusLabel.setText ("Downloading...", juce::dontSendNotification);
+
+        juce::Thread::launch ([this, index]() {
+            juce::String previewUrl;
+            juce::String name;
+            int soundId = 0;
+
+            {
+                const juce::ScopedLock sl (resultsLock);
+                if (index < 0 || index >= static_cast<int> (results.size()))
+                    return;
+                previewUrl = results[static_cast<size_t> (index)].previewUrl;
+                name = results[static_cast<size_t> (index)].name;
+                soundId = results[static_cast<size_t> (index)].id;
+            }
+
+            auto sanitized = juce::File::createLegalFileName (name);
+            auto local = proc.sampleDirectory.getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+
+            if (!local.existsAsFile() && previewUrl.isNotEmpty())
+            {
+                juce::URL url (previewUrl);
+                juce::MemoryBlock mb;
+                if (url.readEntireBinaryStream (mb, 12000))
+                {
+                    local.replaceWithData (mb.getData(), mb.getSize());
+                }
+            }
+
+            juce::MessageManager::callAsync ([this, index, local]() {
+                {
+                    const juce::ScopedLock sl (resultsLock);
+                    if (index >= 0 && index < static_cast<int> (results.size()))
+                        results[static_cast<size_t> (index)].localFile = local;
+                }
+                table.repaintRow (index);
+                proc.loadPreviewFile (local);
+                waveformDisplay.setBuffer (proc.getCachedBuffer());
+                statusLabel.setText ("Ready! Drag waveform to track.", juce::dontSendNotification);
+            });
+        });
+    }
+
+    FreesoundMiniAudioProcessor& proc;
+
+    juce::TextEditor tokenInput;
+    juce::Label apiStatusLabel;
+    juce::TextEditor searchInput;
+    juce::TextButton searchButton { "Search" };
+
+    juce::ComboBox channelBox;
+    juce::Slider durationSlider;
+    juce::Label durationLabel;
+
+    juce::TextButton dirButton { "Folder" };
+    juce::TextButton openFolderButton { "↗" };
+    juce::TextButton infoButton { "ℹ" };
+
+    juce::TableListBox table;
+    WaveformDisplay waveformDisplay;
+
+    juce::TextButton playButton { "▶" };
+    juce::TextButton stopButton { "⏹" };
+
+    juce::Slider pitchSlider;
+    CustomKnobLookAndFeel knobLookAndFeel;
+
+    juce::ToggleButton normCheckbox;
+    juce::Slider volSlider;
+    juce::Label volLabel;
+
+    juce::Label statusLabel;
+
+    std::unique_ptr<juce::FileChooser> fileChooser;
+    std::unique_ptr<InfoOverlay> infoOverlay;
+    std::vector<SoundResult> results;
+    juce::CriticalSection resultsLock;
+    juce::String currentQuery;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FreesoundMiniEditor)
+};
+
+//==============================================================================
+juce::AudioProcessorEditor* FreesoundMiniAudioProcessor::createEditor()
+{
+    return new FreesoundMiniEditor (*this);
+}
+
+//==============================================================================
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new FreesoundMiniAudioProcessor();
+}
