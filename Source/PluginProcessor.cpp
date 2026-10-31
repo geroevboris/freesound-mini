@@ -6,6 +6,8 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
+#include <set>
+#include <atomic>
 
 //==============================================================================
 struct SoundResult
@@ -26,16 +28,146 @@ struct SoundResult
     juce::StringArray tags;
 
     juce::String detectedBpmKey;
+    bool isPinnedRef = false;
+};
+
+struct SearchHistoryEntry
+{
+    juce::String query;
+    std::vector<SoundResult> results;
+    double minSlider = 0.0;
+    double maxSlider = 42.0;
+    int channelId = 1;
+    int typeId = 1;
+    int page = 1;
+    bool hasMore = false;
+};
+
+//==============================================================================
+// Источник аудио в оперативной памяти с поддержкой мгновенного Реверса и Лупа
+class MemoryBufferAudioSource : public juce::PositionableAudioSource
+{
+public:
+    MemoryBufferAudioSource() = default;
+
+    void setBuffer (const juce::AudioBuffer<float>& newBuf)
+    {
+        const juce::ScopedLock sl (lock);
+        buffer.makeCopyOf (newBuf);
+        nextPlayPos.store (0);
+    }
+
+    void setReversed (bool shouldReverse)
+    {
+        if (reversed.load() != shouldReverse)
+        {
+            const juce::ScopedLock sl (lock);
+            int64_t total = buffer.getNumSamples();
+            int64_t cur = nextPlayPos.load();
+            if (total > 0 && cur >= 0 && cur < total)
+                nextPlayPos.store (total - 1 - cur);
+            reversed.store (shouldReverse);
+        }
+    }
+
+    void setLoopingMode (bool shouldLoop)
+    {
+        looping.store (shouldLoop);
+    }
+
+    void prepareToPlay (int, double) override {}
+    void releaseResources() override {}
+
+    void getNextAudioBlock (const juce::AudioSourceChannelInfo& info) override
+    {
+        const juce::ScopedLock sl (lock);
+        int64_t total = buffer.getNumSamples();
+        int numCh = buffer.getNumChannels();
+
+        if (total <= 0 || numCh <= 0)
+        {
+            info.clearActiveBufferRegion();
+            return;
+        }
+
+        int64_t pos = nextPlayPos.load();
+        bool rev = reversed.load();
+        bool loop = looping.load();
+
+        for (int i = 0; i < info.numSamples; ++i)
+        {
+            if (pos >= total)
+            {
+                if (loop)
+                {
+                    pos = 0;
+                }
+                else
+                {
+                    for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
+                        info.buffer->clear (ch, info.startSample + i, info.numSamples - i);
+                    pos = total + 1;
+                    break;
+                }
+            }
+
+            int64_t srcIdx = rev ? (total - 1 - pos) : pos;
+            srcIdx = juce::jlimit ((int64_t) 0, total - 1, srcIdx);
+
+            for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
+            {
+                float sample = buffer.getSample (ch % numCh, (int) srcIdx);
+                info.buffer->setSample (ch, info.startSample + i, sample);
+            }
+
+            ++pos;
+        }
+
+        nextPlayPos.store (pos);
+    }
+
+    void setNextReadPosition (juce::int64 newPosition) override
+    {
+        const juce::ScopedLock sl (lock);
+        int64_t total = buffer.getNumSamples();
+        nextPlayPos.store (juce::jlimit ((int64_t) 0, std::max ((int64_t) 0, total), (int64_t) newPosition));
+    }
+
+    juce::int64 getNextReadPosition() const override
+    {
+        return nextPlayPos.load();
+    }
+
+    juce::int64 getTotalLength() const override
+    {
+        const juce::ScopedLock sl (lock);
+        return buffer.getNumSamples();
+    }
+
+    bool isLooping() const override
+    {
+        return looping.load();
+    }
+
+private:
+    mutable juce::CriticalSection lock;
+    juce::AudioBuffer<float> buffer;
+    std::atomic<int64_t> nextPlayPos { 0 };
+    std::atomic<bool> reversed { false };
+    std::atomic<bool> looping { false };
 };
 
 //==============================================================================
 class FreesoundMiniAudioProcessor : public juce::AudioProcessor
 {
 public:
+    enum PlaybackMode { ModeNormal = 0, ModeReverse = 1, ModeLoop = 2 };
+
     FreesoundMiniAudioProcessor()
         : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true))
     {
         formatManager.registerBasicFormats();
+        memorySource = std::make_unique<MemoryBufferAudioSource>();
         loadGlobalSettings();
 
         if (sampleDirectory == juce::File())
@@ -52,7 +184,7 @@ public:
     {
         transportSource.stop();
         transportSource.setSource (nullptr);
-        readerSource.reset();
+        memorySource.reset();
     }
 
     static juce::File getGlobalSettingsFile()
@@ -107,30 +239,63 @@ public:
         }
     }
 
+    static juce::ValueTree soundToValueTree (const SoundResult& item)
+    {
+        juce::ValueTree child ("Sound");
+        child.setProperty ("id", item.id, nullptr);
+        child.setProperty ("name", item.name, nullptr);
+        child.setProperty ("duration", item.duration, nullptr);
+        child.setProperty ("previewUrl", item.previewUrl, nullptr);
+        child.setProperty ("localFile", item.localFile.getFullPathName(), nullptr);
+        child.setProperty ("username", item.username, nullptr);
+        child.setProperty ("packName", item.packName, nullptr);
+        child.setProperty ("formatType", item.formatType, nullptr);
+        child.setProperty ("sampleRate", item.sampleRate, nullptr);
+        child.setProperty ("bitDepth", item.bitDepth, nullptr);
+        child.setProperty ("channels", item.channels, nullptr);
+        child.setProperty ("license", item.license, nullptr);
+        child.setProperty ("tags", item.tags.joinIntoString (","), nullptr);
+        child.setProperty ("detectedBpmKey", item.detectedBpmKey, nullptr);
+        child.setProperty ("isPinnedRef", item.isPinnedRef, nullptr);
+        return child;
+    }
+
+    SoundResult valueTreeToSound (const juce::ValueTree& c) const
+    {
+        SoundResult r;
+        r.id = (int) c.getProperty ("id", 0);
+        r.name = c.getProperty ("name", "").toString();
+        r.duration = (double) c.getProperty ("duration", 0.0);
+        r.previewUrl = c.getProperty ("previewUrl", "").toString();
+
+        auto fPath = c.getProperty ("localFile", "").toString();
+        if (fPath.isNotEmpty())
+            r.localFile = juce::File (fPath);
+
+        auto favCopy = getFavoriteFileFor (r.id, r.name);
+        if (!r.localFile.existsAsFile() && favCopy.existsAsFile())
+            r.localFile = favCopy;
+
+        r.username = c.getProperty ("username", "").toString();
+        r.packName = c.getProperty ("packName", "").toString();
+        r.formatType = c.getProperty ("formatType", "").toString();
+        r.sampleRate = (int) c.getProperty ("sampleRate", 0);
+        r.bitDepth = (int) c.getProperty ("bitDepth", 0);
+        r.channels = (int) c.getProperty ("channels", 0);
+        r.license = c.getProperty ("license", "").toString();
+        r.tags.addTokens (c.getProperty ("tags", "").toString(), ",", "");
+        r.detectedBpmKey = c.getProperty ("detectedBpmKey", "").toString();
+        r.isPinnedRef = (bool) c.getProperty ("isPinnedRef", false);
+        return r;
+    }
+
     void saveFavoritesIndex()
     {
         const juce::ScopedLock sl (favLock);
         juce::ValueTree root ("FavoritesList");
 
         for (const auto& item : favoriteItems)
-        {
-            juce::ValueTree child ("Sound");
-            child.setProperty ("id", item.id, nullptr);
-            child.setProperty ("name", item.name, nullptr);
-            child.setProperty ("duration", item.duration, nullptr);
-            child.setProperty ("previewUrl", item.previewUrl, nullptr);
-            child.setProperty ("localFile", item.localFile.getFullPathName(), nullptr);
-            child.setProperty ("username", item.username, nullptr);
-            child.setProperty ("packName", item.packName, nullptr);
-            child.setProperty ("formatType", item.formatType, nullptr);
-            child.setProperty ("sampleRate", item.sampleRate, nullptr);
-            child.setProperty ("bitDepth", item.bitDepth, nullptr);
-            child.setProperty ("channels", item.channels, nullptr);
-            child.setProperty ("license", item.license, nullptr);
-            child.setProperty ("tags", item.tags.joinIntoString (","), nullptr);
-            child.setProperty ("detectedBpmKey", item.detectedBpmKey, nullptr);
-            root.appendChild (child, nullptr);
-        }
+            root.appendChild (soundToValueTree (item), nullptr);
 
         if (auto xml = root.createXml())
             getFavoritesIndexFile().replaceWithText (xml->toString());
@@ -151,31 +316,8 @@ public:
                 {
                     for (int i = 0; i < root.getNumChildren(); ++i)
                     {
-                        auto c = root.getChild (i);
-                        SoundResult r;
-                        r.id = (int) c.getProperty ("id", 0);
-                        r.name = c.getProperty ("name", "").toString();
-                        r.duration = (double) c.getProperty ("duration", 0.0);
-                        r.previewUrl = c.getProperty ("previewUrl", "").toString();
-
-                        auto fPath = c.getProperty ("localFile", "").toString();
-                        if (fPath.isNotEmpty())
-                            r.localFile = juce::File (fPath);
-
-                        auto favCopy = getFavoriteFileFor (r.id, r.name);
-                        if (!r.localFile.existsAsFile() && favCopy.existsAsFile())
-                            r.localFile = favCopy;
-
-                        r.username = c.getProperty ("username", "").toString();
-                        r.packName = c.getProperty ("packName", "").toString();
-                        r.formatType = c.getProperty ("formatType", "").toString();
-                        r.sampleRate = (int) c.getProperty ("sampleRate", 0);
-                        r.bitDepth = (int) c.getProperty ("bitDepth", 0);
-                        r.channels = (int) c.getProperty ("channels", 0);
-                        r.license = c.getProperty ("license", "").toString();
-                        r.tags.addTokens (c.getProperty ("tags", "").toString(), ",", "");
-                        r.detectedBpmKey = c.getProperty ("detectedBpmKey", "").toString();
-
+                        auto r = valueTreeToSound (root.getChild (i));
+                        r.isPinnedRef = false;
                         if (r.id > 0)
                             favoriteItems.push_back (r);
                     }
@@ -212,6 +354,7 @@ public:
             if (shouldBeFav)
             {
                 SoundResult copy = sound;
+                copy.isPinnedRef = false;
                 if (sound.localFile.existsAsFile())
                 {
                     sound.localFile.copyFileTo (favFile);
@@ -267,11 +410,35 @@ public:
     const juce::String getProgramName (int) override { return {}; }
     void changeProgramName (int, const juce::String&) override {}
 
+    // Сохранение индивидуального состояния каждого плагина на дорожке
     void getStateInformation (juce::MemoryBlock& destData) override
     {
-        juce::ValueTree tree ("FreesoundMiniSettings");
+        juce::ValueTree tree ("FreesoundMiniInstanceState");
         tree.setProperty ("apiToken", savedToken, nullptr);
         tree.setProperty ("saveDirectory", sampleDirectory.getFullPathName(), nullptr);
+        tree.setProperty ("query", persistedQuery, nullptr);
+        tree.setProperty ("minSlider", persistedMinSlider, nullptr);
+        tree.setProperty ("maxSlider", persistedMaxSlider, nullptr);
+        tree.setProperty ("channelId", persistedChannelId, nullptr);
+        tree.setProperty ("typeId", persistedTypeId, nullptr);
+        tree.setProperty ("playbackMode", (int) playbackMode, nullptr);
+        tree.setProperty ("pitch", pitchSemitones, nullptr);
+        tree.setProperty ("gain", (double) previewGain, nullptr);
+        tree.setProperty ("norm", useNormalization, nullptr);
+        tree.setProperty ("showingFavs", persistedShowingFavs, nullptr);
+        tree.setProperty ("selectedRow", persistedSelectedRow, nullptr);
+        tree.setProperty ("currentPage", persistedCurrentPage, nullptr);
+        tree.setProperty ("hasMorePages", persistedHasMorePages, nullptr);
+
+        juce::ValueTree resNode ("Results");
+        {
+            const juce::ScopedLock sl (stateLock);
+            int limit = std::min ((int) persistedResults.size(), 120);
+            for (int i = 0; i < limit; ++i)
+                resNode.appendChild (soundToValueTree (persistedResults[(size_t) i]), nullptr);
+        }
+        tree.appendChild (resNode, nullptr);
+
         if (auto xml = tree.createXml())
             copyXmlToBinary (*xml, destData);
     }
@@ -291,6 +458,29 @@ public:
                 if (dir.isNotEmpty())
                     sampleDirectory = juce::File (dir);
 
+                persistedQuery = tree.getProperty ("query", "").toString();
+                persistedMinSlider = (double) tree.getProperty ("minSlider", 0.0);
+                persistedMaxSlider = (double) tree.getProperty ("maxSlider", 42.0);
+                persistedChannelId = (int) tree.getProperty ("channelId", 1);
+                persistedTypeId = (int) tree.getProperty ("typeId", 1);
+                setPlaybackMode ((PlaybackMode) (int) tree.getProperty ("playbackMode", 0));
+                pitchSemitones = (double) tree.getProperty ("pitch", 0.0);
+                previewGain = (float) (double) tree.getProperty ("gain", 0.8);
+                useNormalization = (bool) tree.getProperty ("norm", true);
+                persistedShowingFavs = (bool) tree.getProperty ("showingFavs", false);
+                persistedSelectedRow = (int) tree.getProperty ("selectedRow", -1);
+                persistedCurrentPage = (int) tree.getProperty ("currentPage", 1);
+                persistedHasMorePages = (bool) tree.getProperty ("hasMorePages", false);
+
+                auto resNode = tree.getChildWithName ("Results");
+                if (resNode.isValid())
+                {
+                    const juce::ScopedLock sl (stateLock);
+                    persistedResults.clear();
+                    for (int i = 0; i < resNode.getNumChildren(); ++i)
+                        persistedResults.push_back (valueTreeToSound (resNode.getChild (i)));
+                }
+
                 saveGlobalSettings();
             }
         }
@@ -309,7 +499,6 @@ public:
 
         transportSource.stop();
         transportSource.setSource (nullptr);
-        readerSource.reset();
         currentFile = file;
         currentSampleMeta = meta;
         currentSampleMeta.localFile = file;
@@ -336,6 +525,10 @@ public:
                 badgeText = analyzeAudioMusicalBadge (tempBuf, originalFileSampleRate, meta);
                 currentSampleMeta.detectedBpmKey = badgeText;
 
+                memorySource->setBuffer (tempBuf);
+                memorySource->setReversed (playbackMode == ModeReverse);
+                memorySource->setLoopingMode (playbackMode == ModeLoop);
+
                 const juce::ScopedLock sl (bufferLock);
                 cachedBuffer = std::move (tempBuf);
             }
@@ -347,32 +540,53 @@ public:
 
     void rebuildTransport (double startPosSeconds, bool autoStart)
     {
-        if (!currentFile.existsAsFile())
+        if (memorySource == nullptr || memorySource->getTotalLength() <= 0)
             return;
 
         bool wasPlaying = transportSource.isPlaying();
         transportSource.stop();
         transportSource.setSource (nullptr);
-        readerSource.reset();
 
-        if (auto* reader = formatManager.createReaderFor (currentFile))
+        double speedRatio = std::pow (2.0, pitchSemitones / 12.0);
+        transportSource.setSource (memorySource.get(), 0, nullptr, originalFileSampleRate * speedRatio);
+
+        updateGainInternal();
+        transportSource.setPosition (startPosSeconds);
+
+        if (autoStart || wasPlaying)
+            transportSource.start();
+    }
+
+    void setPlaybackMode (PlaybackMode newMode)
+    {
+        playbackMode = newMode;
+        if (memorySource != nullptr)
         {
-            readerSource = std::make_unique<juce::AudioFormatReaderSource> (reader, true);
-
-            double speedRatio = std::pow (2.0, pitchSemitones / 12.0);
-            transportSource.setSource (readerSource.get(), 0, nullptr, originalFileSampleRate * speedRatio);
-
-            updateGainInternal();
-            transportSource.setPosition (startPosSeconds);
-
-            if (autoStart || wasPlaying)
-                transportSource.start();
+            memorySource->setReversed (playbackMode == ModeReverse);
+            memorySource->setLoopingMode (playbackMode == ModeLoop);
         }
+    }
+
+    PlaybackMode getPlaybackMode() const { return playbackMode; }
+
+    PlaybackMode cyclePlaybackMode()
+    {
+        int next = ((int) playbackMode + 1) % 3;
+        setPlaybackMode ((PlaybackMode) next);
+        return playbackMode;
+    }
+
+    void togglePlayPause()
+    {
+        if (transportSource.isPlaying())
+            pausePreview();
+        else
+            playOrResume();
     }
 
     void playOrResume()
     {
-        if (readerSource != nullptr)
+        if (memorySource != nullptr && memorySource->getTotalLength() > 0)
         {
             double len = transportSource.getLengthInSeconds();
             double pos = transportSource.getCurrentPosition();
@@ -383,7 +597,7 @@ public:
         }
         else if (currentFile.existsAsFile())
         {
-            rebuildTransport (0.0, true);
+            loadAndPlayFile (currentFile, currentSampleMeta, false);
         }
     }
 
@@ -398,27 +612,35 @@ public:
         transportSource.setPosition (0.0);
     }
 
-    void seekToRelativePosition (float proportion)
+    bool isAudioPlaying() const
     {
-        proportion = juce::jlimit (0.0f, 1.0f, proportion);
+        return transportSource.isPlaying();
+    }
 
-        if (readerSource == nullptr && currentFile.existsAsFile())
-            rebuildTransport (0.0, false);
+    void seekToVisualProportion (float visualProp)
+    {
+        visualProp = juce::jlimit (0.0f, 1.0f, visualProp);
+
+        if (memorySource == nullptr || memorySource->getTotalLength() <= 0)
+            return;
 
         double length = transportSource.getLengthInSeconds();
         if (length > 0.0)
         {
-            transportSource.setPosition (length * (double) proportion);
+            float engineProp = (playbackMode == ModeReverse) ? (1.0f - visualProp) : visualProp;
+            transportSource.setPosition (length * (double) engineProp);
             transportSource.start();
         }
     }
 
-    float getRelativePlayheadPosition() const
+    float getVisualPlayheadPosition() const
     {
         double length = transportSource.getLengthInSeconds();
         if (length <= 0.0)
             return 0.0f;
-        return (float) juce::jlimit (0.0, 1.0, transportSource.getCurrentPosition() / length);
+
+        float raw = (float) juce::jlimit (0.0, 1.0, transportSource.getCurrentPosition() / length);
+        return (playbackMode == ModeReverse) ? (1.0f - raw) : raw;
     }
 
     void setGain (float g)
@@ -427,24 +649,30 @@ public:
         updateGainInternal();
     }
 
+    float getGain() const { return previewGain; }
+
     void setPitchSemitones (double semitones)
     {
         if (std::abs (pitchSemitones - semitones) < 0.001)
             return;
 
         pitchSemitones = semitones;
-        if (readerSource != nullptr)
+        if (memorySource != nullptr && memorySource->getTotalLength() > 0)
         {
             double pos = transportSource.getCurrentPosition();
             rebuildTransport (pos, false);
         }
     }
 
+    double getPitchSemitones() const { return pitchSemitones; }
+
     void setNormalization (bool shouldNormalize)
     {
         useNormalization = shouldNormalize;
         updateGainInternal();
     }
+
+    bool getNormalization() const { return useNormalization; }
 
     void copyCachedBuffer (juce::AudioBuffer<float>& dest)
     {
@@ -455,8 +683,22 @@ public:
     juce::File getCurrentFile() const { return currentFile; }
     SoundResult getCurrentSampleMeta() const { return currentSampleMeta; }
 
+    // Персистентные данные экземпляра плагина (не сбрасываются при закрытии окна)
     juce::String savedToken;
     juce::File sampleDirectory;
+
+    juce::CriticalSection stateLock;
+    std::vector<SoundResult> persistedResults;
+    std::vector<SearchHistoryEntry> searchHistory;
+    juce::String persistedQuery;
+    double persistedMinSlider = 0.0;
+    double persistedMaxSlider = 42.0;
+    int persistedChannelId = 1;
+    int persistedTypeId = 1;
+    int persistedCurrentPage = 1;
+    bool persistedHasMorePages = false;
+    bool persistedShowingFavs = false;
+    int persistedSelectedRow = -1;
 
 private:
     void updateGainInternal()
@@ -465,7 +707,6 @@ private:
         transportSource.setGain (previewGain * normGain);
     }
 
-    // Умный детектор BPM и тональности с гейтом гармоничности (не выдаёт фейковую ноту на шумах/ударных)
     static juce::String analyzeAudioMusicalBadge (const juce::AudioBuffer<float>& buf, double sr, const SoundResult& meta)
     {
         int numSamples = buf.getNumSamples();
@@ -474,7 +715,6 @@ private:
 
         const float* data = buf.getReadPointer (0);
 
-        // 1. Поиск окна максимальной энергии для оценки гармоничности и высоты тона
         const int winSize = std::min (numSamples, 4096);
         int bestStart = 0;
         float bestEnergy = 0.0f;
@@ -495,8 +735,8 @@ private:
         juce::String detectedKey;
         if (bestEnergy > 0.0001f)
         {
-            int minLag = std::max (8, (int) (sr / 880.0));  // До A5
-            int maxLag = std::min (winSize / 2, (int) (sr / 55.0)); // От A1
+            int minLag = std::max (8, (int) (sr / 880.0));
+            int maxLag = std::min (winSize / 2, (int) (sr / 55.0));
 
             float r0 = 0.0f;
             for (int i = 0; i < winSize / 2; ++i)
@@ -531,7 +771,6 @@ private:
                 }
             }
 
-            // Порог гармоничности 0.62 отсекает белый шум, фоли, дождь и атональную перкуссию
             if (maxCorr >= 0.62f && bestLag > 0)
             {
                 double freq = sr / (double) bestLag;
@@ -540,14 +779,12 @@ private:
                 int pitchClass = ((midiNote % 12) + 12) % 12;
                 detectedKey = noteNames[pitchClass];
 
-                // Проверяем теги или имя на явный минор/мажор
                 juce::String combined = (meta.name + " " + meta.tags.joinIntoString (" ")).toLowerCase();
                 if (combined.contains ("minor") || combined.contains ("min"))
                     detectedKey += "m";
             }
         }
 
-        // 2. Поиск BPM: сначала проверяем явное указание в тегах/имени, затем по огибающей транзиентов
         int detectedBpm = 0;
         for (const auto& t : meta.tags)
         {
@@ -630,6 +867,7 @@ private:
     bool useNormalization = true;
     float loadedFilePeak = 1.0f;
     double originalFileSampleRate = 44100.0;
+    PlaybackMode playbackMode = ModeNormal;
 
     juce::File currentFile;
     SoundResult currentSampleMeta;
@@ -640,7 +878,7 @@ private:
     std::vector<SoundResult> favoriteItems;
 
     juce::AudioFormatManager formatManager;
-    std::unique_ptr<juce::AudioFormatReaderSource> readerSource;
+    std::unique_ptr<MemoryBufferAudioSource> memorySource;
     juce::AudioTransportSource transportSource;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FreesoundMiniAudioProcessor)
@@ -758,9 +996,10 @@ private:
 class IconButton : public juce::Button
 {
 public:
-    enum Type { Play, Pause, Stop, Search, Dice2D, HashTag, Heart, Folder, OpenExternal, Info, Close };
+    enum Type { PlayPause, Stop, Search, Dice2D, HashTag, Heart, BackArrow, ModeCycle, Folder, OpenExternal, Info, Close };
 
-    explicit IconButton (Type t) : juce::Button (""), iconType (t) {}
+    explicit IconButton (Type t, bool noBorder = false)
+        : juce::Button (""), iconType (t), frameless (noBorder) {}
 
     void setActiveState (bool active)
     {
@@ -773,20 +1012,32 @@ public:
 
     bool getActiveState() const { return isActiveState; }
 
+    void setModeIndex (int idx)
+    {
+        if (modeIndex != idx)
+        {
+            modeIndex = idx;
+            repaint();
+        }
+    }
+
     void paintButton (juce::Graphics& g, bool isMouseOver, bool isButtonDown) override
     {
         auto b = getLocalBounds().toFloat().reduced (1.0f);
 
-        juce::Colour bg = juce::Colour (0xff16181d);
-        if (isButtonDown)      bg = juce::Colour (0xff24332c);
-        else if (isMouseOver)  bg = juce::Colour (0xff1e2229);
+        if (!frameless)
+        {
+            juce::Colour bg = juce::Colour (0xff16181d);
+            if (isButtonDown)      bg = juce::Colour (0xff24332c);
+            else if (isMouseOver)  bg = juce::Colour (0xff1e2229);
 
-        g.setColour (bg);
-        g.fillRoundedRectangle (b, 7.0f);
+            g.setColour (bg);
+            g.fillRoundedRectangle (b, 7.0f);
 
-        bool highlightBorder = isMouseOver || isActiveState;
-        g.setColour (highlightBorder ? juce::Colour (0xff52b788).withAlpha (0.55f) : juce::Colour (0xff262930));
-        g.drawRoundedRectangle (b, 7.0f, 1.0f);
+            bool highlightBorder = isMouseOver || isActiveState || (iconType == ModeCycle && modeIndex != 0);
+            g.setColour (highlightBorder ? juce::Colour (0xff52b788).withAlpha (0.55f) : juce::Colour (0xff262930));
+            g.drawRoundedRectangle (b, 7.0f, 1.0f);
+        }
 
         if (iconType == Heart)
         {
@@ -794,29 +1045,49 @@ public:
             return;
         }
 
-        juce::Colour iconCol = (isButtonDown || isActiveState) ? juce::Colour (0xff52b788)
-                             : (isMouseOver ? juce::Colour (0xff74c69d) : juce::Colours::lightgrey);
+        juce::Colour iconCol = juce::Colours::lightgrey;
+        if (frameless)
+        {
+            if (iconType == HashTag)
+                iconCol = isMouseOver ? juce::Colour (0xff52b788) : juce::Colours::grey;
+            else
+                iconCol = isButtonDown ? juce::Colour (0xff52b788)
+                        : (isMouseOver ? juce::Colours::white : juce::Colours::white.withAlpha (0.9f));
+        }
+        else
+        {
+            bool activeTint = isButtonDown || isActiveState || (iconType == ModeCycle && modeIndex != 0);
+            iconCol = activeTint ? juce::Colour (0xff52b788)
+                    : (isMouseOver ? juce::Colour (0xff74c69d) : juce::Colours::lightgrey);
+        }
+
+        if (!isEnabled())
+            iconCol = iconCol.withAlpha (0.28f);
+
         g.setColour (iconCol);
 
         auto cx = b.getCentreX();
         auto cy = b.getCentreY();
-        auto s = std::min (b.getWidth(), b.getHeight()) * 0.28f;
+        auto s = std::min (b.getWidth(), b.getHeight()) * (frameless ? 0.32f : 0.28f);
 
         juce::Path p;
         switch (iconType)
         {
-            case Play:
-                p.addTriangle (cx - s * 0.7f, cy - s, cx - s * 0.7f, cy + s, cx + s * 1.1f, cy);
-                g.fillPath (p);
-                break;
-
-            case Pause:
-                g.fillRoundedRectangle (cx - s * 0.85f, cy - s, s * 0.55f, s * 2.0f, 1.5f);
-                g.fillRoundedRectangle (cx + s * 0.30f, cy - s, s * 0.55f, s * 2.0f, 1.5f);
+            case PlayPause:
+                if (isActiveState) // В состоянии воспроизведения рисуем иконку Паузы
+                {
+                    g.fillRoundedRectangle (cx - s * 0.8f, cy - s * 0.95f, s * 0.52f, s * 1.9f, 1.5f);
+                    g.fillRoundedRectangle (cx + s * 0.28f, cy - s * 0.95f, s * 0.52f, s * 1.9f, 1.5f);
+                }
+                else // В состоянии покоя рисуем чистый белый треугольник Play
+                {
+                    p.addTriangle (cx - s * 0.65f, cy - s * 0.95f, cx - s * 0.65f, cy + s * 0.95f, cx + s * 1.05f, cy);
+                    g.fillPath (p);
+                }
                 break;
 
             case Stop:
-                g.fillRoundedRectangle (cx - s * 0.85f, cy - s * 0.85f, s * 1.7f, s * 1.7f, 2.0f);
+                g.fillRoundedRectangle (cx - s * 0.82f, cy - s * 0.82f, s * 1.64f, s * 1.64f, 2.0f);
                 break;
 
             case Search:
@@ -826,9 +1097,46 @@ public:
                 g.strokePath (p, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
                 break;
 
+            case BackArrow:
+                p.startNewSubPath (cx + s * 0.8f, cy);
+                p.lineTo (cx - s * 0.8f, cy);
+                p.startNewSubPath (cx - s * 0.2f, cy - s * 0.65f);
+                p.lineTo (cx - s * 0.8f, cy);
+                p.lineTo (cx - s * 0.2f, cy + s * 0.65f);
+                g.strokePath (p, juce::PathStrokeType (1.7f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                break;
+
+            case ModeCycle:
+                if (modeIndex == 0) // Стрелка вперёд (Normal)
+                {
+                    p.startNewSubPath (cx - s * 0.95f, cy);
+                    p.lineTo (cx + s * 0.85f, cy);
+                    p.startNewSubPath (cx + s * 0.25f, cy - s * 0.6f);
+                    p.lineTo (cx + s * 0.85f, cy);
+                    p.lineTo (cx + s * 0.25f, cy + s * 0.6f);
+                    g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                }
+                else if (modeIndex == 1) // Стрелка назад (Reverse)
+                {
+                    p.startNewSubPath (cx + s * 0.95f, cy);
+                    p.lineTo (cx - s * 0.85f, cy);
+                    p.startNewSubPath (cx - s * 0.25f, cy - s * 0.6f);
+                    p.lineTo (cx - s * 0.85f, cy);
+                    p.lineTo (cx - s * 0.25f, cy + s * 0.6f);
+                    g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                }
+                else // Замкнутая стрелка (Loop)
+                {
+                    p.addCentredArc (cx, cy, s * 0.85f, s * 0.85f, 0.0f, 0.4f, juce::MathConstants<float>::twoPi - 0.35f, true);
+                    p.startNewSubPath (cx + s * 0.3f, cy - s * 0.95f);
+                    p.lineTo (cx + s * 0.85f, cy - s * 0.55f);
+                    p.lineTo (cx + s * 0.2f, cy - s * 0.35f);
+                    g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                }
+                break;
+
             case Dice2D:
             {
-                // Схематичный плоский 2D-кубик в стиле Glitchmachines
                 float boxR = s * 1.18f;
                 juce::Rectangle<float> diceRect (cx - boxR, cy - boxR, boxR * 2.0f, boxR * 2.0f);
                 g.drawRoundedRectangle (diceRect, 3.0f, 1.5f);
@@ -845,17 +1153,17 @@ public:
 
             case HashTag:
             {
-                float d = s * 0.45f;
-                float len = s * 0.95f;
-                p.startNewSubPath (cx - d + 1.0f, cy - len);
-                p.lineTo (cx - d - 1.0f, cy + len);
-                p.startNewSubPath (cx + d + 1.0f, cy - len);
-                p.lineTo (cx + d - 1.0f, cy + len);
+                float d = s * 0.38f;
+                float len = s * 0.78f;
+                p.startNewSubPath (cx - d + 0.8f, cy - len);
+                p.lineTo (cx - d - 0.8f, cy + len);
+                p.startNewSubPath (cx + d + 0.8f, cy - len);
+                p.lineTo (cx + d - 0.8f, cy + len);
                 p.startNewSubPath (cx - len, cy - d);
                 p.lineTo (cx + len, cy - d);
                 p.startNewSubPath (cx - len, cy + d);
                 p.lineTo (cx + len, cy + d);
-                g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                g.strokePath (p, juce::PathStrokeType (1.35f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
                 break;
             }
 
@@ -905,7 +1213,167 @@ public:
 
 private:
     Type iconType;
+    bool frameless = false;
     bool isActiveState = false;
+    int modeIndex = 0;
+};
+
+//==============================================================================
+// Всплывающий паспорт сэмпла (CallOutBox), открывающийся правее плагина и закрывающийся по клику мимо
+class SamplePassportPopup : public juce::Component
+{
+public:
+    SamplePassportPopup (const SoundResult& s,
+                         bool compactMode,
+                         std::function<void(const juce::String&)> tagCallback,
+                         std::function<void(const SoundResult&)> similarCallback)
+        : sound (s), isCompact (compactMode),
+          onTagClick (std::move (tagCallback)),
+          onSimilarClick (std::move (similarCallback))
+    {
+        if (sound.license.isNotEmpty())
+        {
+            juce::String shortLic = "Creative Commons License";
+            if (sound.license.containsIgnoreCase ("zero") || sound.license.contains ("cc0"))
+                shortLic = "CC0 1.0 (Public Domain)";
+            else if (sound.license.contains ("by-nc"))
+                shortLic = "CC BY-NC (Non-Commercial)";
+            else if (sound.license.contains ("by"))
+                shortLic = "CC BY (Attribution)";
+
+            licenseLink.setButtonText (shortLic);
+            licenseLink.setURL (juce::URL (sound.license));
+            licenseLink.setJustificationType (juce::Justification::centredLeft);
+            licenseLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff52b788));
+            addAndMakeVisible (licenseLink);
+        }
+
+        similarBtn.setButtonText ("Show Similar Sounds");
+        similarBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1d2b24));
+        similarBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff52b788));
+        similarBtn.onClick = [this] {
+            auto sCopy = sound;
+            auto cb = onSimilarClick;
+            if (auto* callout = findParentComponentOfClass<juce::CallOutBox>())
+                callout->dismiss();
+            if (cb)
+                cb (sCopy);
+        };
+        addAndMakeVisible (similarBtn);
+
+        int maxTags = isCompact ? std::min (6, sound.tags.size()) : std::min (10, sound.tags.size());
+        for (int i = 0; i < maxTags; ++i)
+        {
+            auto tagStr = sound.tags[i].trim();
+            if (tagStr.isNotEmpty())
+            {
+                auto btn = std::make_unique<juce::TextButton> ("#" + tagStr);
+                btn->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff181b22));
+                btn->setColour (juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+                btn->onClick = [this, tagStr] {
+                    auto cb = onTagClick;
+                    if (auto* callout = findParentComponentOfClass<juce::CallOutBox>())
+                        callout->dismiss();
+                    if (cb)
+                        cb (tagStr);
+                };
+                addAndMakeVisible (btn.get());
+                tagButtons.push_back (std::move (btn));
+            }
+        }
+
+        setSize (isCompact ? 255 : 295, isCompact ? 195 : 265);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff121418));
+
+        int pad = 12;
+        int w = getWidth() - pad * 2;
+
+        g.setColour (juce::Colour (0xff52b788));
+        g.drawText (isCompact ? "QUICK INFO" : "SAMPLE PASSPORT", pad, 8, w, 18, juce::Justification::centredLeft);
+
+        g.setColour (juce::Colours::white);
+        g.drawText (sound.name, pad, 28, w, 20, juce::Justification::centredLeft, true);
+
+        g.setColour (juce::Colours::grey);
+        juce::String authorLine = "By @" + (sound.username.isNotEmpty() ? sound.username : "unknown")
+                                + "  |  #" + juce::String (sound.id);
+        g.drawText (authorLine, pad, 48, w, 18, juce::Justification::centredLeft, true);
+
+        juce::String specs = (sound.formatType.isNotEmpty() ? sound.formatType.toUpperCase() : "AUDIO");
+        if (sound.sampleRate > 0)
+            specs += " | " + juce::String (sound.sampleRate / 1000.0, 1) + " kHz";
+        if (sound.bitDepth > 0)
+            specs += " | " + juce::String (sound.bitDepth) + "-bit";
+        if (sound.channels > 0)
+            specs += " | " + juce::String (sound.channels == 1 ? "Mono" : "Stereo");
+
+        g.setColour (juce::Colours::lightgrey);
+        g.drawText (specs, pad, 68, w, 18, juce::Justification::centredLeft, true);
+
+        int nextY = 88;
+        if (!isCompact && sound.detectedBpmKey.isNotEmpty())
+        {
+            g.setColour (juce::Colour (0xff52b788));
+            g.drawText ("Analysis: " + sound.detectedBpmKey, pad, nextY, w, 18, juce::Justification::centredLeft);
+            nextY += 20;
+        }
+
+        g.setColour (juce::Colours::grey);
+        g.drawText ("License:", pad, nextY, 54, 20, juce::Justification::centredLeft);
+
+        if (!isCompact)
+        {
+            g.setColour (juce::Colour (0xff52b788));
+            g.drawText ("TAGS (Click to search):", pad, nextY + 56, w, 18, juce::Justification::centredLeft);
+        }
+    }
+
+    void resized() override
+    {
+        int pad = 12;
+        int w = getWidth() - pad * 2;
+        int licY = (!isCompact && sound.detectedBpmKey.isNotEmpty()) ? 108 : 88;
+
+        if (licenseLink.isVisible())
+            licenseLink.setBounds (pad + 54, licY, w - 54, 20);
+
+        int btnY = licY + 24;
+        similarBtn.setBounds (pad, btnY, w, 26);
+
+        int tagsStartY = isCompact ? (btnY + 32) : (btnY + 52);
+        int x = pad;
+        int y = tagsStartY;
+        int maxX = getWidth() - pad;
+
+        for (auto& btn : tagButtons)
+        {
+            int bw = std::min (130, std::max (48, (int) btn->getButtonText().length() * 7 + 16));
+            if (x + bw > maxX)
+            {
+                x = pad;
+                y += 25;
+            }
+            if (y + 22 <= getHeight() - 4)
+                btn->setBounds (x, y, bw, 22);
+            else
+                btn->setVisible (false);
+
+            x += bw + 5;
+        }
+    }
+
+private:
+    SoundResult sound;
+    bool isCompact = false;
+    std::function<void(const juce::String&)> onTagClick;
+    std::function<void(const SoundResult&)> onSimilarClick;
+    juce::HyperlinkButton licenseLink;
+    juce::TextButton similarBtn;
+    std::vector<std::unique_ptr<juce::TextButton>> tagButtons;
 };
 
 //==============================================================================
@@ -916,15 +1384,21 @@ public:
     std::function<void(float)> onSeekRequested;
     std::function<void()> onDragged;
     std::function<float()> getPlayheadPos;
-    std::function<void()> onSampleInfoClicked;
+    std::function<bool()> getIsPlaying;
+    std::function<void(juce::Component*)> onSampleInfoClicked;
     std::function<void()> onSampleFavClicked;
+    std::function<void()> onModeCycleClicked;
+    std::function<void()> onPlaybackStateChanged;
 
     WaveformDisplay()
     {
+        modeCycleBtn.onClick = [this] { if (onModeCycleClicked) onModeCycleClicked(); };
+        addChildComponent (modeCycleBtn);
+
         sampleFavBtn.onClick = [this] { if (onSampleFavClicked) onSampleFavClicked(); };
         addChildComponent (sampleFavBtn);
 
-        sampleInfoBtn.onClick = [this] { if (onSampleInfoClicked) onSampleInfoClicked(); };
+        sampleInfoBtn.onClick = [this] { if (onSampleInfoClicked) onSampleInfoClicked (&sampleInfoBtn); };
         addChildComponent (sampleInfoBtn);
 
         startTimerHz (30);
@@ -938,14 +1412,17 @@ public:
     void setWaveformData (const juce::AudioBuffer<float>& newBuffer,
                           const juce::String& sampleTitle,
                           const juce::String& bpmKeyBadge,
-                          bool isFav)
+                          bool isFav,
+                          int modeIdx)
     {
         localBuffer.makeCopyOf (newBuffer);
         currentTitle = sampleTitle;
         currentBadge = bpmKeyBadge;
         sampleFavBtn.setActiveState (isFav);
+        modeCycleBtn.setModeIndex (modeIdx);
 
         bool hasAudio = (localBuffer.getNumSamples() > 0);
+        modeCycleBtn.setVisible (hasAudio);
         sampleFavBtn.setVisible (hasAudio);
         sampleInfoBtn.setVisible (hasAudio);
 
@@ -957,8 +1434,14 @@ public:
         sampleFavBtn.setActiveState (isFav);
     }
 
+    void updateModeState (int modeIdx)
+    {
+        modeCycleBtn.setModeIndex (modeIdx);
+    }
+
     void resized() override
     {
+        modeCycleBtn.setBounds (8, 6, 24, 22);
         sampleInfoBtn.setBounds (getWidth() - 28, 6, 22, 22);
         sampleFavBtn.setBounds (getWidth() - 54, 6, 22, 22);
     }
@@ -1072,13 +1555,11 @@ public:
         g.setGradientFill (grad);
         g.fillPath (path);
 
-        // Вертикальный курсор воспроизведения
         float cursorX = lastCursorProp * (float) width;
         g.setColour (juce::Colours::white.withAlpha (0.85f));
         g.drawVerticalLine ((int) std::round (cursorX), 4.0f, (float) height - 20.0f);
         g.fillEllipse (cursorX - 3.0f, 3.0f, 6.0f, 6.0f);
 
-        // Жёлтая зона: Умный бейдж BPM и Тональности справа внизу
         int badgeWidth = 0;
         if (currentBadge.isNotEmpty())
         {
@@ -1093,7 +1574,6 @@ public:
             g.drawText (currentBadge, badgeRect.toNearestInt(), juce::Justification::centred, false);
         }
 
-        // Красная зона: Название текущего сэмпла по центру внизу волны
         if (currentTitle.isNotEmpty())
         {
             int sideMargin = (badgeWidth > 0) ? (badgeWidth + 14) : 12;
@@ -1106,6 +1586,17 @@ public:
 private:
     void timerCallback() override
     {
+        if (getIsPlaying)
+        {
+            bool playingNow = getIsPlaying();
+            if (playingNow != lastPlayingState)
+            {
+                lastPlayingState = playingNow;
+                if (onPlaybackStateChanged)
+                    onPlaybackStateChanged();
+            }
+        }
+
         if (getPlayheadPos && localBuffer.getNumSamples() > 0)
         {
             float newProp = getPlayheadPos();
@@ -1121,8 +1612,10 @@ private:
     juce::String currentTitle;
     juce::String currentBadge;
     float lastCursorProp = 0.0f;
+    bool lastPlayingState = false;
     bool dragStarted = false;
 
+    IconButton modeCycleBtn  { IconButton::ModeCycle };
     IconButton sampleFavBtn  { IconButton::Heart };
     IconButton sampleInfoBtn { IconButton::Info };
 };
@@ -1167,7 +1660,7 @@ public:
         g.setColour (active ? juce::Colour (0xff52b788).withAlpha (0.65f) : juce::Colour (0xff232730));
         g.drawRoundedRectangle (b, 7.0f, 1.0f);
 
-        float arrowX = (float) width - 15.0f;
+        float arrowX = (float) width - 14.0f;
         float arrowY = (float) height * 0.5f;
         juce::Path chevron;
         chevron.startNewSubPath (arrowX - 3.5f, arrowY - 1.5f);
@@ -1180,7 +1673,7 @@ public:
 
     void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
     {
-        label.setBounds (8, 1, box.getWidth() - 24, box.getHeight() - 2);
+        label.setBounds (8, 1, box.getWidth() - 22, box.getHeight() - 2);
     }
 
     void fillTextEditorBackground (juce::Graphics& g, int width, int height, juce::TextEditor& textEditor) override
@@ -1281,149 +1774,6 @@ public:
 };
 
 //==============================================================================
-// Карточка подробной информации о сэмпле (по клику на (i) на волне)
-class SampleDetailsOverlay : public juce::Component
-{
-public:
-    std::function<void(const juce::String&)> onTagClicked;
-    std::function<void(int, const juce::String&)> onFindSimilarClicked;
-
-    SampleDetailsOverlay()
-    {
-        setInterceptsMouseClicks (true, true);
-
-        closeBtn.onClick = [this] { setVisible (false); };
-        addAndMakeVisible (closeBtn);
-
-        similarBtn.setButtonText ("Find Similar Sounds");
-        similarBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1d2b24));
-        similarBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff52b788));
-        similarBtn.onClick = [this] {
-            if (currentSound.id > 0 && onFindSimilarClicked)
-            {
-                setVisible (false);
-                onFindSimilarClicked (currentSound.id, currentSound.name);
-            }
-        };
-        addAndMakeVisible (similarBtn);
-    }
-
-    void showSoundDetails (const SoundResult& s)
-    {
-        currentSound = s;
-        tagButtons.clear();
-
-        int maxTags = std::min (10, s.tags.size());
-        for (int i = 0; i < maxTags; ++i)
-        {
-            auto tagStr = s.tags[i].trim();
-            if (tagStr.isNotEmpty())
-            {
-                auto btn = std::make_unique<juce::TextButton> ("#" + tagStr);
-                btn->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1a1d24));
-                btn->setColour (juce::TextButton::textColourOffId, juce::Colours::lightgrey);
-                btn->onClick = [this, tagStr] {
-                    setVisible (false);
-                    if (onTagClicked)
-                        onTagClicked (tagStr);
-                };
-                addAndMakeVisible (btn.get());
-                tagButtons.push_back (std::move (btn));
-            }
-        }
-
-        resized();
-        setVisible (true);
-        toFront (true);
-        repaint();
-    }
-
-    void mouseDown (const juce::MouseEvent&) override {}
-
-    void paint (juce::Graphics& g) override
-    {
-        g.fillAll (juce::Colour (0xff0a0b0d).withAlpha (0.94f));
-
-        auto card = getLocalBounds().reduced (18).toFloat();
-        g.setColour (juce::Colour (0xff14161a));
-        g.fillRoundedRectangle (card, 12.0f);
-        g.setColour (juce::Colour (0xff52b788).withAlpha (0.45f));
-        g.drawRoundedRectangle (card, 12.0f, 1.0f);
-
-        auto area = getLocalBounds().reduced (32);
-        g.setColour (juce::Colour (0xff52b788));
-        g.drawText ("SAMPLE PASSPORT", area.removeFromTop (26), juce::Justification::centredLeft);
-
-        g.setColour (juce::Colours::white);
-        g.drawText (currentSound.name, area.removeFromTop (24), juce::Justification::centredLeft, true);
-
-        g.setColour (juce::Colours::grey);
-        juce::String authorLine = "Author: @" + (currentSound.username.isNotEmpty() ? currentSound.username : "unknown")
-                                + "   |   ID: #" + juce::String (currentSound.id);
-        g.drawText (authorLine, area.removeFromTop (20), juce::Justification::centredLeft, true);
-
-        if (currentSound.packName.isNotEmpty())
-            g.drawText ("Pack: " + currentSound.packName, area.removeFromTop (20), juce::Justification::centredLeft, true);
-
-        juce::String specs = "Format: " + (currentSound.formatType.isNotEmpty() ? currentSound.formatType.toUpperCase() : "AUDIO");
-        if (currentSound.sampleRate > 0)
-            specs += "  |  " + juce::String (currentSound.sampleRate / 1000.0, 1) + " kHz";
-        if (currentSound.bitDepth > 0)
-            specs += "  |  " + juce::String (currentSound.bitDepth) + "-bit";
-        if (currentSound.channels > 0)
-            specs += "  |  " + juce::String (currentSound.channels == 1 ? "Mono" : "Stereo");
-
-        g.setColour (juce::Colours::lightgrey);
-        g.drawText (specs, area.removeFromTop (22), juce::Justification::centredLeft, true);
-
-        if (currentSound.detectedBpmKey.isNotEmpty())
-        {
-            g.setColour (juce::Colour (0xff52b788));
-            g.drawText ("Analysis: " + currentSound.detectedBpmKey, area.removeFromTop (22), juce::Justification::centredLeft);
-        }
-
-        if (currentSound.license.isNotEmpty())
-        {
-            g.setColour (juce::Colours::grey);
-            g.drawText ("License: " + currentSound.license, area.removeFromTop (20), juce::Justification::centredLeft, true);
-        }
-
-        area.removeFromTop (44); // Место под кнопку Find Similar Sounds
-
-        g.setColour (juce::Colour (0xff52b788));
-        g.drawText ("TAGS (Click any tag to search):", area.removeFromTop (22), juce::Justification::centredLeft);
-    }
-
-    void resized() override
-    {
-        closeBtn.setBounds (getWidth() - 52, 26, 26, 26);
-        similarBtn.setBounds (32, 182, getWidth() - 64, 28);
-
-        int x = 32;
-        int y = 244;
-        int maxX = getWidth() - 32;
-
-        for (auto& btn : tagButtons)
-        {
-            int w = std::min (150, std::max (54, (int) btn->getButtonText().length() * 8 + 18));
-            if (x + w > maxX)
-            {
-                x = 32;
-                y += 28;
-            }
-            btn->setBounds (x, y, w, 24);
-            x += w + 6;
-        }
-    }
-
-private:
-    SoundResult currentSound;
-    IconButton closeBtn { IconButton::Close };
-    juce::TextButton similarBtn;
-    std::vector<std::unique_ptr<juce::TextButton>> tagButtons;
-};
-
-//==============================================================================
 class InfoOverlay : public juce::Component
 {
 public:
@@ -1467,13 +1817,13 @@ public:
         area.removeFromTop (6);
 
         juce::String text =
-            "2. Search, Tags (#) & Random Dice:\n"
-            "   Use [#] for curated noise/texture tags or the 2D Dice for pure random discovery.\n\n"
-            "3. Favorites (Heart) & Multi-Drag:\n"
-            "   Heart any sound to save a copy into 'FreesoundSamples/Favorites'.\n"
-            "   Select multiple rows (Shift/Cmd) and drag directly from the table or waveform.\n\n"
-            "4. Sample Passport (i) & Sorting:\n"
-            "   Click DUR header to sort by length. Click (i) on waveform for tags & Similar Sounds.";
+            "2. Waveform Playback Modes (Top-Left Icon):\n"
+            "   Click to cycle: Normal (->), Reverse (<-), and Loop.\n\n"
+            "3. Transport & Shortcuts:\n"
+            "   Single Spacebar: Play / Pause. Double Spacebar: Stop & Reset.\n"
+            "   Up / Down Arrows: Navigate & auto-preview sounds.\n\n"
+            "4. Right-Click Menu & Reference Pinning:\n"
+            "   Right-click any row for Sample Info or Show Similar (pins [REF] at top).";
 
         g.drawFittedText (text, area, juce::Justification::topLeft, 20);
     }
@@ -1494,13 +1844,15 @@ private:
 class FreesoundMiniEditor : public juce::AudioProcessorEditor,
                             public juce::TableListBoxModel,
                             public juce::DragAndDropContainer,
-                            private juce::Thread
+                            private juce::Thread,
+                            private juce::Timer
 {
 public:
     explicit FreesoundMiniEditor (FreesoundMiniAudioProcessor& p)
         : AudioProcessorEditor (&p), Thread ("FreesoundSearchThread"), proc (p)
     {
         setLookAndFeel (&modernLF);
+        setWantsKeyboardFocus (true);
 
         if (proc.savedToken.isEmpty())
             proc.loadGlobalSettings();
@@ -1563,16 +1915,22 @@ public:
         };
         addAndMakeVisible (infoButton);
 
-        // Поисковая строка + Лупа + Облако тегов (#) + 2D Кубик рандома + Фильтр Избранного
-        searchInput.setTextToShowWhenEmpty ("Search sounds (808, vinyl, bowl)...", juce::Colours::grey);
-        searchInput.onReturnKey = [this] { startNewSearch(); };
-        addAndMakeVisible (searchInput);
+        // Кнопка возврата по истории поиска + Поле поиска с встроенным '#' внутри справа
+        backHistoryButton.onClick = [this] { restorePreviousSearchFromHistory(); };
+        backHistoryButton.setEnabled (!proc.searchHistory.empty());
+        addAndMakeVisible (backHistoryButton);
 
-        searchButton.onClick = [this] { startNewSearch(); };
-        addAndMakeVisible (searchButton);
+        searchInput.setTextToShowWhenEmpty ("Search sounds (808, vinyl, bowl)...", juce::Colours::grey);
+        searchInput.setIndents (8, 0);
+        searchInput.setText (proc.persistedQuery, false);
+        searchInput.onReturnKey = [this] { startNewSearch (true); };
+        addAndMakeVisible (searchInput);
 
         tagMenuButton.onClick = [this] { showCuratedTagsMenu(); };
         addAndMakeVisible (tagMenuButton);
+
+        searchButton.onClick = [this] { startNewSearch (true); };
+        addAndMakeVisible (searchButton);
 
         randomDiceButton.onClick = [this] { startPureRandomSearch(); };
         addAndMakeVisible (randomDiceButton);
@@ -1580,27 +1938,38 @@ public:
         favFilterButton.onClick = [this] { toggleFavoritesView(); };
         addAndMakeVisible (favFilterButton);
 
-        // Панель фильтров: Каналы + Тип (All / One-Shots / Loops) + Диапазон длительности
+        // Панель фильтров с автоматическим обновлением поиска
         channelBox.addItem ("All Ch", 1);
         channelBox.addItem ("Mono", 2);
         channelBox.addItem ("Stereo", 3);
-        channelBox.setSelectedId (1, juce::dontSendNotification);
+        channelBox.setSelectedId (proc.persistedChannelId, juce::dontSendNotification);
+        channelBox.onChange = [this] {
+            proc.persistedChannelId = channelBox.getSelectedId();
+            triggerAutoSearchFromFilter();
+        };
         addAndMakeVisible (channelBox);
 
         typeBox.addItem ("All Types", 1);
         typeBox.addItem ("One-Shots", 2);
         typeBox.addItem ("Loops", 3);
-        typeBox.setSelectedId (1, juce::dontSendNotification);
+        typeBox.setSelectedId (proc.persistedTypeId, juce::dontSendNotification);
+        typeBox.onChange = [this] {
+            proc.persistedTypeId = typeBox.getSelectedId();
+            triggerAutoSearchFromFilter();
+        };
         addAndMakeVisible (typeBox);
 
         durRangeSlider.setSliderStyle (juce::Slider::TwoValueHorizontal);
         durRangeSlider.setRange (0.0, 100.0, 0.1);
-        durRangeSlider.setMinAndMaxValues (0.0, 42.0, juce::dontSendNotification);
+        durRangeSlider.setMinAndMaxValues (proc.persistedMinSlider, proc.persistedMaxSlider, juce::dontSendNotification);
         durRangeSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
         durRangeSlider.onValueChange = [this] {
             if (durRangeSlider.getMinValue() > durRangeSlider.getMaxValue())
                 durRangeSlider.setMinValue (durRangeSlider.getMaxValue(), juce::dontSendNotification);
+            proc.persistedMinSlider = durRangeSlider.getMinValue();
+            proc.persistedMaxSlider = durRangeSlider.getMaxValue();
             updateDurationLabel();
+            startTimer (280); // Автопоиск после окончания перетаскивания ползунка
         };
         addAndMakeVisible (durRangeSlider);
 
@@ -1610,7 +1979,6 @@ public:
         updateDurationLabel();
         addAndMakeVisible (durValueLabel);
 
-        // Таблица с поддержкой мультивыбора, сортировки по DUR и перетаскивания
         table.setModel (this);
         table.getHeader().addColumn ("", 1, 28, 28, 28, juce::TableHeaderComponent::notResizable);
         table.getHeader().addColumn ("NAME", 2, 185, 100, 800, juce::TableHeaderComponent::defaultFlags);
@@ -1619,15 +1987,31 @@ public:
         table.setMultipleSelectionEnabled (true);
         addAndMakeVisible (table);
 
-        // Дисплей волны
         waveformDisplay.onSeekRequested = [this] (float proportion) {
-            proc.seekToRelativePosition (proportion);
+            proc.seekToVisualProportion (proportion);
+            playPauseButton.setActiveState (proc.isAudioPlaying());
         };
         waveformDisplay.onDragged = [this] {
             startExternalDragFromWaveform();
         };
         waveformDisplay.getPlayheadPos = [this] {
-            return proc.getRelativePlayheadPosition();
+            return proc.getVisualPlayheadPosition();
+        };
+        waveformDisplay.getIsPlaying = [this] {
+            return proc.isAudioPlaying();
+        };
+        waveformDisplay.onPlaybackStateChanged = [this] {
+            playPauseButton.setActiveState (proc.isAudioPlaying());
+        };
+        waveformDisplay.onModeCycleClicked = [this] {
+            auto newMode = proc.cyclePlaybackMode();
+            waveformDisplay.updateModeState ((int) newMode);
+            if (newMode == FreesoundMiniAudioProcessor::ModeNormal)
+                statusLabel.setText ("Mode: Normal playback (->)", juce::dontSendNotification);
+            else if (newMode == FreesoundMiniAudioProcessor::ModeReverse)
+                statusLabel.setText ("Mode: Reverse playback (<-)", juce::dontSendNotification);
+            else
+                statusLabel.setText ("Mode: Loop playback", juce::dontSendNotification);
         };
         waveformDisplay.onSampleFavClicked = [this] {
             auto cur = proc.getCurrentSampleMeta();
@@ -1639,42 +2023,42 @@ public:
                 table.repaint();
             }
         };
-        waveformDisplay.onSampleInfoClicked = [this] {
+        waveformDisplay.onSampleInfoClicked = [this] (juce::Component* anchorBtn) {
             auto cur = proc.getCurrentSampleMeta();
-            if (cur.id > 0 && sampleDetailsOverlay != nullptr)
-            {
-                sampleDetailsOverlay->setBounds (getLocalBounds());
-                sampleDetailsOverlay->showSoundDetails (cur);
-            }
+            if (cur.id > 0)
+                launchFloatingSamplePopup (cur, false, anchorBtn ? anchorBtn->getScreenBounds() : getScreenBounds());
         };
         addAndMakeVisible (waveformDisplay);
 
-        // Транспорт
-        playButton.onClick = [this] { proc.playOrResume(); };
-        addAndMakeVisible (playButton);
+        // Единая белая кнопка Play/Pause без обводки + белая кнопка Stop без обводки
+        playPauseButton.onClick = [this] {
+            proc.togglePlayPause();
+            playPauseButton.setActiveState (proc.isAudioPlaying());
+        };
+        addAndMakeVisible (playPauseButton);
 
-        pauseButton.onClick = [this] { proc.pausePreview(); };
-        addAndMakeVisible (pauseButton);
-
-        stopButton.onClick = [this] { proc.stopPreview(); };
+        stopButton.onClick = [this] {
+            proc.stopPreview();
+            playPauseButton.setActiveState (false);
+        };
         addAndMakeVisible (stopButton);
 
         pitchSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
         pitchSlider.setRange (-12.0, 12.0, 1.0);
-        pitchSlider.setValue (0.0);
+        pitchSlider.setValue (proc.getPitchSemitones(), juce::dontSendNotification);
         pitchSlider.setDoubleClickReturnValue (true, 0.0);
         pitchSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
         pitchSlider.onValueChange = [this] { proc.setPitchSemitones (pitchSlider.getValue()); };
         addAndMakeVisible (pitchSlider);
 
         normCheckbox.setButtonText ("Norm -6dB");
-        normCheckbox.setToggleState (true, juce::dontSendNotification);
+        normCheckbox.setToggleState (proc.getNormalization(), juce::dontSendNotification);
         normCheckbox.onClick = [this] { proc.setNormalization (normCheckbox.getToggleState()); };
         addAndMakeVisible (normCheckbox);
 
         volSlider.setSliderStyle (juce::Slider::LinearBar);
         volSlider.setRange (0.0, 1.0, 0.01);
-        volSlider.setValue (0.8);
+        volSlider.setValue (proc.getGain(), juce::dontSendNotification);
         volSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
         volSlider.onValueChange = [this] { proc.setGain ((float) volSlider.getValue()); };
         addAndMakeVisible (volSlider);
@@ -1689,25 +2073,30 @@ public:
         statusLabel.setBorderSize (juce::BorderSize<int> (0));
         addAndMakeVisible (statusLabel);
 
-        sampleDetailsOverlay = std::make_unique<SampleDetailsOverlay>();
-        sampleDetailsOverlay->onTagClicked = [this] (const juce::String& tag) {
-            showingFavoritesOnly = false;
-            favFilterButton.setActiveState (false);
-            searchInput.setText (tag, false);
-            startNewSearch();
-        };
-        sampleDetailsOverlay->onFindSimilarClicked = [this] (int soundId, const juce::String& soundName) {
-            startSimilarSearch (soundId, soundName);
-        };
-        sampleDetailsOverlay->setVisible (false);
-        addChildComponent (sampleDetailsOverlay.get());
-
         infoOverlay = std::make_unique<InfoOverlay> ([this] { infoOverlay->setVisible (false); });
         infoOverlay->setVisible (false);
         addChildComponent (infoOverlay.get());
 
+        // Восстановление сохранённой выдачи для этого экземпляра плагина при открытии/разворачивании
+        {
+            const juce::ScopedLock sl (proc.stateLock);
+            results = proc.persistedResults;
+            currentPage = proc.persistedCurrentPage;
+            hasMorePages = proc.persistedHasMorePages;
+            showingFavoritesOnly = proc.persistedShowingFavs;
+            lastTriggeredRow = proc.persistedSelectedRow;
+        }
+        favFilterButton.setActiveState (showingFavoritesOnly);
+        table.updateContent();
+        if (lastTriggeredRow >= 0 && lastTriggeredRow < getNumRows())
+            table.selectRow (lastTriggeredRow, false, true);
+
+        if (!results.empty())
+            statusLabel.setText ("Restored: " + juce::String (getNumRows()) + " sounds", juce::dontSendNotification);
+
         updateTopBarVisibility();
         refreshWaveformFromProcessor();
+        playPauseButton.setActiveState (proc.isAudioPlaying());
 
         setResizable (true, true);
         setResizeLimits (370, 540, 1100, 1200);
@@ -1716,9 +2105,48 @@ public:
 
     ~FreesoundMiniEditor() override
     {
+        stopTimer();
         signalThreadShouldExit();
         stopThread (4000);
         setLookAndFeel (nullptr);
+    }
+
+    // Обработка Пробела (одиночный = Play/Pause, двойной = Stop) и стрелок вверх/вниз
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress::spaceKey && !searchInput.hasKeyboardFocus (false) && !tokenInput.hasKeyboardFocus (false))
+        {
+            double now = juce::Time::getMillisecondCounterHiRes();
+            if (now - lastSpaceBarTimeMs < 320.0)
+            {
+                proc.stopPreview();
+                playPauseButton.setActiveState (false);
+                statusLabel.setText ("Stopped (0.0s)", juce::dontSendNotification);
+            }
+            else
+            {
+                proc.togglePlayPause();
+                playPauseButton.setActiveState (proc.isAudioPlaying());
+            }
+            lastSpaceBarTimeMs = now;
+            return true;
+        }
+
+        if (key == juce::KeyPress::downKey && getNumRows() > 0)
+        {
+            int nextRow = juce::jlimit (0, getNumRows() - 1, table.getSelectedRow() + 1);
+            table.selectRow (nextRow);
+            return true;
+        }
+
+        if (key == juce::KeyPress::upKey && getNumRows() > 0)
+        {
+            int prevRow = juce::jlimit (0, getNumRows() - 1, table.getSelectedRow() - 1);
+            table.selectRow (prevRow);
+            return true;
+        }
+
+        return AudioProcessorEditor::keyPressed (key);
     }
 
     void paint (juce::Graphics& g) override
@@ -1730,7 +2158,6 @@ public:
     {
         auto area = getLocalBounds().reduced (12);
 
-        // Верхняя панель
         auto topBar = area.removeFromTop (28);
         infoButton.setBounds (topBar.removeFromRight (28));
         topBar.removeFromRight (4);
@@ -1752,21 +2179,24 @@ public:
 
         area.removeFromTop (8);
 
-        // Строка поиска + Лупа + Теги (#) + 2D Кубик + Сердце (фильтр Favorites)
+        // Строка поиска: Назад (<-) + Поле поиска (с кнопкой # внутри справа) + Лупа + 2D Кубик + Сердце
         auto searchRow = area.removeFromTop (30);
         favFilterButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (4);
         randomDiceButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (4);
-        tagMenuButton.setBounds (searchRow.removeFromRight (30));
-        searchRow.removeFromRight (4);
         searchButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (6);
+
+        backHistoryButton.setBounds (searchRow.removeFromLeft (28));
+        searchRow.removeFromLeft (4);
+
         searchInput.setBounds (searchRow);
+        tagMenuButton.setBounds (searchInput.getRight() - 25, searchInput.getY() + 3, 22, 24);
+        tagMenuButton.toFront (false);
 
         area.removeFromTop (6);
 
-        // Строка фильтров: Каналы + Тип (All / One-Shots / Loops) + Диапазон длительности
         auto filterRow = area.removeFromTop (24);
         channelBox.setBounds (filterRow.removeFromLeft (72));
         filterRow.removeFromLeft (5);
@@ -1778,7 +2208,6 @@ public:
 
         area.removeFromTop (8);
 
-        // Нижняя панель транспорта
         auto bottomControl = area.removeFromBottom (48);
         area.removeFromBottom (6);
 
@@ -1788,31 +2217,26 @@ public:
         area.removeFromBottom (4);
         statusLabel.setBounds (area.removeFromBottom (18));
 
-        // Таблица
         table.setBounds (area);
         int nameColW = std::max (120, table.getWidth() - (28 + 58 + 56 + 18));
         table.getHeader().setColumnWidth (2, nameColW);
 
-        // Кнопки транспорта
+        // Нижняя панель: белые иконки Play/Pause и Stop без обводки + Pitch + Norm + Vol
         auto bArea = bottomControl;
-        playButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
-        bArea.removeFromLeft (4);
-        pauseButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
-        bArea.removeFromLeft (4);
-        stopButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
+        playPauseButton.setBounds (bArea.removeFromLeft (30).withSizeKeepingCentre (28, 28));
+        bArea.removeFromLeft (2);
+        stopButton.setBounds (bArea.removeFromLeft (30).withSizeKeepingCentre (28, 28));
 
-        bArea.removeFromLeft (6);
+        bArea.removeFromLeft (8);
         pitchSlider.setBounds (bArea.removeFromLeft (54));
 
-        bArea.removeFromLeft (4);
-        normCheckbox.setBounds (bArea.removeFromLeft (78));
+        bArea.removeFromLeft (6);
+        normCheckbox.setBounds (bArea.removeFromLeft (80));
 
-        bArea.removeFromLeft (4);
+        bArea.removeFromLeft (6);
         volLabel.setBounds (bArea.removeFromLeft (26));
         volSlider.setBounds (bArea.reduced (0, 14));
 
-        if (sampleDetailsOverlay != nullptr)
-            sampleDetailsOverlay->setBounds (getLocalBounds());
         if (infoOverlay != nullptr)
             infoOverlay->setBounds (getLocalBounds());
     }
@@ -1823,12 +2247,29 @@ public:
         return static_cast<int> (results.size());
     }
 
-    void paintRowBackground (juce::Graphics& g, int, int, int, bool rowIsSelected) override
+    void paintRowBackground (juce::Graphics& g, int rowNumber, int width, int height, bool rowIsSelected) override
     {
-        if (rowIsSelected)
+        bool isPinned = false;
+        {
+            const juce::ScopedLock sl (resultsLock);
+            if (rowNumber >= 0 && rowNumber < static_cast<int> (results.size()))
+                isPinned = results[static_cast<size_t> (rowNumber)].isPinnedRef;
+        }
+
+        if (isPinned)
+        {
+            g.fillAll (rowIsSelected ? juce::Colour (0xff23382e) : juce::Colour (0xff17261f));
+            g.setColour (juce::Colour (0xff52b788).withAlpha (0.5f));
+            g.drawHorizontalLine (height - 1, 0.0f, (float) width);
+        }
+        else if (rowIsSelected)
+        {
             g.fillAll (juce::Colour (0xff1d2b24));
+        }
         else
+        {
             g.fillAll (juce::Colour (0xff101216));
+        }
     }
 
     void paintCell (juce::Graphics& g, int rowNumber, int columnId, int width, int height, bool) override
@@ -1864,8 +2305,19 @@ public:
         }
         else if (columnId == 2)
         {
-            g.setColour (juce::Colours::white);
-            g.drawText (item.name, 6, 0, width - 10, height, juce::Justification::centredLeft, true);
+            int textX = 6;
+            if (item.isPinnedRef)
+            {
+                juce::Rectangle<float> pinBadge (4.0f, (float) (height / 2 - 8), 34.0f, 16.0f);
+                g.setColour (juce::Colour (0xff52b788));
+                g.fillRoundedRectangle (pinBadge, 4.0f);
+                g.setColour (juce::Colour (0xff0a0b0d));
+                g.drawText ("REF", pinBadge.toNearestInt(), juce::Justification::centred, false);
+                textX = 44;
+            }
+
+            g.setColour (item.isPinnedRef ? juce::Colour (0xff74c69d) : juce::Colours::white);
+            g.drawText (item.name, textX, 0, width - textX - 6, height, juce::Justification::centredLeft, true);
         }
         else if (columnId == 3)
         {
@@ -1887,7 +2339,6 @@ public:
         }
     }
 
-    // Сортировка по клику на заголовок колонки (DUR или NAME)
     void sortOrderChanged (int newSortColumnId, bool isForwards) override
     {
         if (newSortColumnId == 0)
@@ -1896,18 +2347,20 @@ public:
         {
             const juce::ScopedLock sl (resultsLock);
             std::stable_sort (results.begin(), results.end(), [newSortColumnId, isForwards] (const SoundResult& a, const SoundResult& b) {
-                if (newSortColumnId == 3) // DUR
+                if (a.isPinnedRef != b.isPinnedRef)
+                    return a.isPinnedRef; // Закрепленный [REF] всегда остается первой строкой
+                if (newSortColumnId == 3)
                     return isForwards ? (a.duration < b.duration) : (a.duration > b.duration);
-                if (newSortColumnId == 2) // NAME
+                if (newSortColumnId == 2)
                     return isForwards ? (a.name.compareIgnoreCase (b.name) < 0) : (a.name.compareIgnoreCase (b.name) > 0);
                 return false;
             });
         }
+        syncStateToProcessor();
         table.updateContent();
         table.repaint();
     }
 
-    // Мульти-перетаскивание выделенных файлов прямо из таблицы в Ableton Live
     juce::var getDragSourceDescription (const juce::SparseSet<int>& currentlySelectedRows) override
     {
         juce::StringArray filesToDrag;
@@ -1937,7 +2390,6 @@ public:
 
     void selectedRowsChanged (int lastRowSelected) override
     {
-        // Если выделено несколько строк (через Shift/Cmd), автоматически докачиваем все не скачанные файлы
         auto selected = table.getSelectedRows();
         if (selected.size() > 1)
         {
@@ -1948,27 +2400,48 @@ public:
         if (lastRowSelected >= 0 && lastRowSelected != lastTriggeredRow)
         {
             lastTriggeredRow = lastRowSelected;
+            proc.persistedSelectedRow = lastRowSelected;
             pitchSlider.setValue (0.0, juce::dontSendNotification);
             triggerLoadAndPlay (lastRowSelected);
         }
     }
 
-    void cellClicked (int rowNumber, int columnId, const juce::MouseEvent&) override
+    void cellClicked (int rowNumber, int columnId, const juce::MouseEvent& e) override
     {
         if (rowNumber < 0)
             return;
 
-        // Клик по первому столбцу (Сердце) переключает избранное
+        SoundResult item;
+        {
+            const juce::ScopedLock sl (resultsLock);
+            if (rowNumber >= static_cast<int> (results.size()))
+                return;
+            item = results[static_cast<size_t> (rowNumber)];
+        }
+
+        // Контекстное меню по правому клику (ПКМ) на звуке
+        if (e.mods.isPopupMenu())
+        {
+            juce::PopupMenu m;
+            m.addItem (1, "Sample Info");
+            m.addItem (2, "Show Similar Sounds");
+            m.addItem (3, "Open on Freesound.org");
+
+            auto rowScreenRect = table.getRowPosition (rowNumber, true) + table.getScreenPosition();
+            m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (e.getScreenX(), e.getScreenY(), 2, 2)),
+                             [this, item, rowScreenRect] (int res) {
+                                 if (res == 1)
+                                     launchFloatingSamplePopup (item, true, rowScreenRect);
+                                 else if (res == 2)
+                                     startSimilarSearchWithPinnedRef (item);
+                                 else if (res == 3 && item.id > 0)
+                                     juce::URL ("https://freesound.org/s/" + juce::String (item.id) + "/").launchInDefaultBrowser();
+                             });
+            return;
+        }
+
         if (columnId == 1)
         {
-            SoundResult item;
-            {
-                const juce::ScopedLock sl (resultsLock);
-                if (rowNumber >= static_cast<int> (results.size()))
-                    return;
-                item = results[static_cast<size_t> (rowNumber)];
-            }
-
             bool makeFav = !proc.isSoundFavorite (item.id);
             proc.setSoundFavorite (item, makeFav);
 
@@ -1979,19 +2452,16 @@ public:
                 waveformDisplay.updateFavoriteState (makeFav);
 
             if (showingFavoritesOnly && !makeFav)
-            {
                 toggleFavoritesView (true);
-            }
             else
-            {
                 table.repaintRow (rowNumber);
-            }
             return;
         }
 
         if (table.getNumSelectedRows() <= 1)
         {
             lastTriggeredRow = rowNumber;
+            proc.persistedSelectedRow = rowNumber;
             pitchSlider.setValue (0.0, juce::dontSendNotification);
             triggerLoadAndPlay (rowNumber);
         }
@@ -1999,18 +2469,27 @@ public:
 
     void applySearchResults (std::vector<SoundResult> newResults, bool append, bool more)
     {
-        declusterResults (newResults);
-
         {
             const juce::ScopedLock sl (resultsLock);
-            if (append)
-                results.insert (results.end(), newResults.begin(), newResults.end());
-            else
-                results = std::move (newResults);
+            if (!append)
+            {
+                results.clear();
+                if (hasPinnedReference && pinnedReferenceSound.id > 0)
+                {
+                    SoundResult refCopy = pinnedReferenceSound;
+                    refCopy.isPinnedRef = true;
+                    results.push_back (refCopy);
+                }
+            }
+
+            // Строгий отсев однотипных дубликатов (по префиксу имени без цифр и по автору)
+            filterAndAppendDiverseResults (results, newResults);
 
             hasMorePages = more;
             isLoadingMore = false;
         }
+
+        syncStateToProcessor();
         table.updateContent();
         statusLabel.setText ("Loaded: " + juce::String (getNumRows()) + (hasMorePages ? "+ sounds (scroll for more)" : " sounds"),
                              juce::dontSendNotification);
@@ -2043,18 +2522,26 @@ public:
                 }
             }
 
-            // Если этот звук уже помечен как Favorite, синхронизируем копию в папку Favorites
             if (proc.isSoundFavorite (soundId) && matchedMeta.id > 0)
                 proc.setSoundFavorite (matchedMeta, true);
+
+            syncStateToProcessor();
 
             if (matchedRow >= 0)
                 table.repaintRow (matchedRow);
 
             if (shouldAutoPlay && matchedMeta.id > 0)
             {
-                proc.loadAndPlayFile (local, matchedMeta, true);
+                juce::String badge = proc.loadAndPlayFile (local, matchedMeta, true);
+                {
+                    const juce::ScopedLock sl (resultsLock);
+                    if (matchedRow >= 0 && matchedRow < static_cast<int> (results.size()))
+                        results[static_cast<size_t> (matchedRow)].detectedBpmKey = badge;
+                }
+                syncStateToProcessor();
                 refreshWaveformFromProcessor();
-                statusLabel.setText ("Ready! Drag from table or waveform to Ableton.", juce::dontSendNotification);
+                playPauseButton.setActiveState (proc.isAudioPlaying());
+                statusLabel.setText ("Ready! Space: Play/Pause, 2x Space: Stop.", juce::dontSendNotification);
             }
         }
         else if (shouldAutoPlay)
@@ -2064,33 +2551,177 @@ public:
     }
 
 private:
-    // Умное разбавление выдачи: не более 2 звуков подряд от одного автора или из одного пака
-    static void declusterResults (std::vector<SoundResult>& list)
+    void timerCallback() override
     {
-        if (list.size() <= 3)
+        stopTimer();
+        triggerAutoSearchFromFilter();
+    }
+
+    void triggerAutoSearchFromFilter()
+    {
+        if (showingFavoritesOnly)
             return;
 
-        std::vector<SoundResult> primary;
-        std::vector<SoundResult> deferred;
-        std::map<juce::String, int> authorCounts;
+        if (searchInput.getText().trim().isNotEmpty() || !results.empty())
+            startNewSearch (false);
+    }
 
-        for (const auto& item : list)
+    void syncStateToProcessor()
+    {
+        const juce::ScopedLock sl (proc.stateLock);
+        proc.persistedResults = results;
+        proc.persistedQuery = searchInput.getText().trim();
+        proc.persistedMinSlider = durRangeSlider.getMinValue();
+        proc.persistedMaxSlider = durRangeSlider.getMaxValue();
+        proc.persistedChannelId = channelBox.getSelectedId();
+        proc.persistedTypeId = typeBox.getSelectedId();
+        proc.persistedCurrentPage = currentPage;
+        proc.persistedHasMorePages = hasMorePages;
+        proc.persistedShowingFavs = showingFavoritesOnly;
+        proc.persistedSelectedRow = lastTriggeredRow;
+    }
+
+    void pushCurrentStateToHistory()
+    {
+        const juce::ScopedLock sl (resultsLock);
+        if (results.empty())
+            return;
+
+        SearchHistoryEntry entry;
+        entry.query = searchInput.getText().trim();
+        entry.results = results;
+        entry.minSlider = durRangeSlider.getMinValue();
+        entry.maxSlider = durRangeSlider.getMaxValue();
+        entry.channelId = channelBox.getSelectedId();
+        entry.typeId = typeBox.getSelectedId();
+        entry.page = currentPage;
+        entry.hasMore = hasMorePages;
+
+        proc.searchHistory.push_back ( std::move (entry) );
+        if (proc.searchHistory.size() > 15)
+            proc.searchHistory.erase (proc.searchHistory.begin());
+
+        backHistoryButton.setEnabled (true);
+    }
+
+    void restorePreviousSearchFromHistory()
+    {
+        if (proc.searchHistory.empty())
+            return;
+
+        if (isThreadRunning())
+            stopThread (2000);
+
+        auto entry = proc.searchHistory.back();
+        proc.searchHistory.pop_back();
+        backHistoryButton.setEnabled (!proc.searchHistory.empty());
+
+        showingFavoritesOnly = false;
+        favFilterButton.setActiveState (false);
+        hasPinnedReference = false;
+        similarSoundIdSnapshot = 0;
+
+        searchInput.setText (entry.query, false);
+        durRangeSlider.setMinAndMaxValues (entry.minSlider, entry.maxSlider, juce::dontSendNotification);
+        updateDurationLabel();
+        channelBox.setSelectedId (entry.channelId, juce::dontSendNotification);
+        typeBox.setSelectedId (entry.typeId, juce::dontSendNotification);
+
         {
-            juce::String key = item.username.isNotEmpty() ? item.username : item.name.substring (0, 8);
-            int count = authorCounts[key];
-            if (count < 2)
+            const juce::ScopedLock sl (resultsLock);
+            results = entry.results;
+            currentPage = entry.page;
+            hasMorePages = entry.hasMore;
+            isLoadingMore = false;
+        }
+
+        syncStateToProcessor();
+        table.updateContent();
+        statusLabel.setText ("Stepped back (" + juce::String (getNumRows()) + " sounds)", juce::dontSendNotification);
+    }
+
+    // Всплывающий поп-ап паспорта, позиционирующийся у правой границы плагина
+    void launchFloatingSamplePopup (const SoundResult& s, bool compact, juce::Rectangle<int> targetScreenBounds)
+    {
+        auto content = std::make_unique<SamplePassportPopup> (
+            s,
+            compact,
+            [this] (const juce::String& clickedTag) {
+                pushCurrentStateToHistory();
+                showingFavoritesOnly = false;
+                favFilterButton.setActiveState (false);
+                hasPinnedReference = false;
+                searchInput.setText (clickedTag, false);
+                startNewSearch (false);
+            },
+            [this] (const SoundResult& refSound) {
+                startSimilarSearchWithPinnedRef (refSound);
+            });
+
+        auto editorScreen = getScreenBounds();
+        juce::Rectangle<int> rightEdgeAnchor (editorScreen.getRight() - 4,
+                                              targetScreenBounds.getCentreY() - 8,
+                                              6, 16);
+
+        juce::CallOutBox::launchAsynchronously (std::move (content), rightEdgeAnchor, nullptr);
+    }
+
+    // Нормализация префикса имени (удаление цифр, расширений и символов), чтобы отсекать пачки вроде "DIZI FLUTE LOOP 01..13"
+    static juce::String normalizeSeriesKey (const juce::String& rawName)
+    {
+        auto lower = rawName.toLowerCase();
+        if (lower.contains ("."))
+            lower = lower.upToLastOccurrenceOf (".", false, false);
+
+        juce::String lettersOnly;
+        for (int i = 0; i < lower.length(); ++i)
+        {
+            auto ch = lower[i];
+            if (juce::CharacterFunctions::isLetter (ch))
+                lettersOnly += ch;
+        }
+        return lettersOnly.substring (0, 12);
+    }
+
+    static void filterAndAppendDiverseResults (std::vector<SoundResult>& dest, const std::vector<SoundResult>& incoming)
+    {
+        std::map<juce::String, int> authorCounts;
+        std::map<juce::String, int> seriesCounts;
+        std::set<int> existingIds;
+
+        for (const auto& existing : dest)
+        {
+            existingIds.insert (existing.id);
+            if (!existing.isPinnedRef)
             {
-                primary.push_back (item);
-                authorCounts[key] = count + 1;
-            }
-            else
-            {
-                deferred.push_back (item);
+                if (existing.username.isNotEmpty())
+                    authorCounts[existing.username.toLowerCase()]++;
+                auto sKey = normalizeSeriesKey (existing.name);
+                if (sKey.length() >= 4)
+                    seriesCounts[sKey]++;
             }
         }
 
-        primary.insert (primary.end(), deferred.begin(), deferred.end());
-        list = std::move (primary);
+        for (const auto& item : incoming)
+        {
+            if (existingIds.count (item.id) > 0)
+                continue;
+
+            auto authKey = item.username.toLowerCase();
+            auto sKey = normalizeSeriesKey (item.name);
+
+            if (authKey.isNotEmpty() && authorCounts[authKey] >= 2)
+                continue;
+            if (sKey.length() >= 4 && seriesCounts[sKey] >= 2)
+                continue;
+
+            dest.push_back (item);
+            existingIds.insert (item.id);
+            if (authKey.isNotEmpty())
+                authorCounts[authKey]++;
+            if (sKey.length() >= 4)
+                seriesCounts[sKey]++;
+        }
     }
 
     void showCuratedTagsMenu()
@@ -2156,15 +2787,16 @@ private:
                                 auto it = tagMap.find (result);
                                 if (it != tagMap.end())
                                 {
+                                    pushCurrentStateToHistory();
                                     showingFavoritesOnly = false;
                                     favFilterButton.setActiveState (false);
+                                    hasPinnedReference = false;
                                     searchInput.setText (it->second, false);
-                                    startNewSearch();
+                                    startNewSearch (false);
                                 }
                             });
     }
 
-    // Чистый рандом без подтверждающих окон: очищает запрос и достаёт случайный срез Freesound
     void startPureRandomSearch()
     {
         if (isThreadRunning())
@@ -2182,8 +2814,11 @@ private:
             return;
         }
 
+        pushCurrentStateToHistory();
+
         showingFavoritesOnly = false;
         favFilterButton.setActiveState (false);
+        hasPinnedReference = false;
         searchInput.clear();
 
         static const char* randomSeeds[] = {
@@ -2221,20 +2856,27 @@ private:
         startThread();
     }
 
-    void startSimilarSearch (int soundId, const juce::String& soundName)
+    // Закрепление референсного звука на первой строке [REF] (в стиле Ableton) и поиск похожих
+    void startSimilarSearchWithPinnedRef (const SoundResult& refSound)
     {
         if (isThreadRunning())
             stopThread (2000);
 
         searchTokenSnapshot = proc.savedToken.trim();
-        if (searchTokenSnapshot.isEmpty())
+        if (searchTokenSnapshot.isEmpty() || refSound.id <= 0)
             return;
+
+        pushCurrentStateToHistory();
 
         showingFavoritesOnly = false;
         favFilterButton.setActiveState (false);
 
-        similarSoundIdSnapshot = soundId;
-        lastTriggeredRow = -1;
+        pinnedReferenceSound = refSound;
+        pinnedReferenceSound.isPinnedRef = true;
+        hasPinnedReference = true;
+
+        similarSoundIdSnapshot = refSound.id;
+        lastTriggeredRow = 0;
         currentPage = 1;
         isPaginationFetch = false;
         isLoadingMore = true;
@@ -2243,10 +2885,11 @@ private:
         {
             const juce::ScopedLock sl (resultsLock);
             results.clear();
+            results.push_back (pinnedReferenceSound);
         }
         table.updateContent();
 
-        statusLabel.setText ("Finding sounds similar to: " + soundName.substring (0, 24) + "...", juce::dontSendNotification);
+        statusLabel.setText ("Pinned [REF]: " + refSound.name.substring (0, 22) + " - loading similar...", juce::dontSendNotification);
         startThread();
     }
 
@@ -2269,13 +2912,14 @@ private:
                 hasMorePages = false;
                 isLoadingMore = false;
             }
+            syncStateToProcessor();
             table.updateContent();
             statusLabel.setText ("Favorites library: " + juce::String (getNumRows()) + " saved sounds", juce::dontSendNotification);
         }
         else
         {
             if (searchInput.getText().trim().isNotEmpty())
-                startNewSearch();
+                startNewSearch (false);
             else
                 startPureRandomSearch();
         }
@@ -2348,7 +2992,7 @@ private:
         durValueLabel.setText (minText + " - " + maxText, juce::dontSendNotification);
     }
 
-    void startNewSearch()
+    void startNewSearch (bool recordHistory = true)
     {
         if (isThreadRunning())
             stopThread (2000);
@@ -2356,8 +3000,12 @@ private:
         if (tokenInput.isVisible())
             commitTokenAndHideIfValid();
 
+        if (recordHistory)
+            pushCurrentStateToHistory();
+
         showingFavoritesOnly = false;
         favFilterButton.setActiveState (false);
+        hasPinnedReference = false;
         similarSoundIdSnapshot = 0;
 
         searchTokenSnapshot = proc.savedToken.trim();
@@ -2447,7 +3095,7 @@ private:
         proc.copyCachedBuffer (temp);
         auto meta = proc.getCurrentSampleMeta();
         bool isFav = (meta.id > 0) ? proc.isSoundFavorite (meta.id) : false;
-        waveformDisplay.setWaveformData (temp, meta.name, meta.detectedBpmKey, isFav);
+        waveformDisplay.setWaveformData (temp, meta.name, meta.detectedBpmKey, isFav, (int) proc.getPlaybackMode());
     }
 
     void triggerLoadAndPlay (int index)
@@ -2468,8 +3116,10 @@ private:
                 if (index >= 0 && index < static_cast<int> (results.size()))
                     results[static_cast<size_t> (index)].detectedBpmKey = badge;
             }
+            syncStateToProcessor();
             refreshWaveformFromProcessor();
-            statusLabel.setText ("Playing. Drag from table or waveform to Ableton!", juce::dontSendNotification);
+            playPauseButton.setActiveState (proc.isAudioPlaying());
+            statusLabel.setText ("Playing. Space: Play/Pause, 2x Space: Stop.", juce::dontSendNotification);
         }
         else
         {
@@ -2491,113 +3141,134 @@ private:
             downloadSoundAtRow (index, false);
     }
 
-    void run() override
+    void parseJsonIntoList (const juce::var& resultsVar, std::vector<SoundResult>& outList)
     {
-        juce::String urlStr;
-        bool appendFlag = isPaginationFetch;
-
-        if (similarSoundIdSnapshot > 0)
-        {
-            urlStr = "https://freesound.org/apiv2/sounds/" + juce::String (similarSoundIdSnapshot)
-                   + "/similar/?token=" + juce::URL::addEscapeChars (searchTokenSnapshot, true)
-                   + "&fields=id,name,duration,previews,username,pack,type,samplerate,bitdepth,channels,license,tags&page_size=40";
-        }
-        else
-        {
-            juce::String maxBoundStr = maxIsInfinitySnapshot ? "*" : juce::String (std::max (minDurSnapshot + 0.1, maxDurSnapshot), 2);
-            juce::String filterStr = "duration:[" + juce::String (minDurSnapshot, 2) + " TO " + maxBoundStr + "]";
-
-            if (channelFilterSnapshot == 2) filterStr += " channels:1";
-            else if (channelFilterSnapshot == 3) filterStr += " channels:2";
-
-            // Фильтр структуры: One-Shots (без ограничения длительности!) vs Loops
-            if (typeFilterSnapshot == 2)      filterStr += " NOT tag:loop";
-            else if (typeFilterSnapshot == 3) filterStr += " tag:loop";
-
-            int pageToFetch = currentPage;
-
-            urlStr = "https://freesound.org/apiv2/search/text/?query="
-                   + juce::URL::addEscapeChars (searchQuerySnapshot, true)
-                   + "&filter=" + juce::URL::addEscapeChars (filterStr, true)
-                   + "&token=" + juce::URL::addEscapeChars (searchTokenSnapshot, true)
-                   + "&fields=id,name,duration,previews,username,pack,type,samplerate,bitdepth,channels,license,tags&page_size=40&page="
-                   + juce::String (pageToFetch);
-        }
-
-        juce::URL url (urlStr);
-        auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
-                           .withConnectionTimeoutMs (10000);
-
-        juce::String response;
-        if (auto stream = url.createInputStream (options))
-            response = stream->readEntireStreamAsString();
-
-        if (threadShouldExit())
+        if (!resultsVar.isArray())
             return;
 
-        auto varJson = juce::JSON::parse (response);
-        if (auto* obj = varJson.getDynamicObject())
+        for (auto& elem : *resultsVar.getArray())
         {
-            auto nextVar = obj->getProperty ("next");
-            bool more = (similarSoundIdSnapshot == 0) && nextVar.isString() && nextVar.toString().isNotEmpty();
-
-            auto resultsVar = obj->getProperty ("results");
-            if (resultsVar.isArray())
-            {
-                auto* resultsArray = resultsVar.getArray();
-                std::vector<SoundResult> newResults;
-
-                for (auto& elem : *resultsArray)
-                {
-                    if (threadShouldExit())
-                        return;
-
-                    SoundResult r;
-                    r.id = static_cast<int> (elem["id"]);
-                    r.name = elem["name"].toString();
-                    r.duration = static_cast<double> (elem["duration"]);
-                    r.username = elem["username"].toString();
-                    r.packName = elem["pack"].toString();
-                    r.formatType = elem["type"].toString();
-                    r.sampleRate = static_cast<int> (elem["samplerate"]);
-                    r.bitDepth = static_cast<int> (elem["bitdepth"]);
-                    r.channels = static_cast<int> (elem["channels"]);
-                    r.license = elem["license"].toString();
-
-                    if (auto* tagsArr = elem["tags"].getArray())
-                    {
-                        for (auto& t : *tagsArr)
-                            r.tags.add (t.toString());
-                    }
-
-                    if (auto* prev = elem["previews"].getDynamicObject())
-                    {
-                        r.previewUrl = prev->getProperty ("preview-hq-mp3").toString();
-                        if (r.previewUrl.isEmpty())
-                            r.previewUrl = prev->getProperty ("preview-lq-mp3").toString();
-                    }
-
-                    auto sanitizedName = juce::File::createLegalFileName (r.name);
-                    auto target = proc.sampleDirectory.getChildFile (juce::String (r.id) + "_" + sanitizedName + ".mp3");
-                    if (target.existsAsFile())
-                        r.localFile = target;
-                    else
-                    {
-                        auto favCopy = proc.getFavoriteFileFor (r.id, r.name);
-                        if (favCopy.existsAsFile())
-                            r.localFile = favCopy;
-                    }
-
-                    newResults.push_back (r);
-                }
-
-                juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
-                juce::MessageManager::callAsync ([safeThis, newResults, appendFlag, more]() {
-                    if (safeThis != nullptr)
-                        safeThis->applySearchResults (newResults, appendFlag, more);
-                });
+            if (threadShouldExit())
                 return;
+
+            SoundResult r;
+            r.id = static_cast<int> (elem["id"]);
+            r.name = elem["name"].toString();
+            r.duration = static_cast<double> (elem["duration"]);
+            r.username = elem["username"].toString();
+            r.packName = elem["pack"].toString();
+            r.formatType = elem["type"].toString();
+            r.sampleRate = static_cast<int> (elem["samplerate"]);
+            r.bitDepth = static_cast<int> (elem["bitdepth"]);
+            r.channels = static_cast<int> (elem["channels"]);
+            r.license = elem["license"].toString();
+
+            if (auto* tagsArr = elem["tags"].getArray())
+            {
+                for (auto& t : *tagsArr)
+                    r.tags.add (t.toString());
             }
+
+            if (auto* prev = elem["previews"].getDynamicObject())
+            {
+                r.previewUrl = prev->getProperty ("preview-hq-mp3").toString();
+                if (r.previewUrl.isEmpty())
+                    r.previewUrl = prev->getProperty ("preview-lq-mp3").toString();
+            }
+
+            auto sanitizedName = juce::File::createLegalFileName (r.name);
+            auto target = proc.sampleDirectory.getChildFile (juce::String (r.id) + "_" + sanitizedName + ".mp3");
+            if (target.existsAsFile())
+                r.localFile = target;
+            else
+            {
+                auto favCopy = proc.getFavoriteFileFor (r.id, r.name);
+                if (favCopy.existsAsFile())
+                    r.localFile = favCopy;
+            }
+
+            outList.push_back (r);
+        }
+    }
+
+    void run() override
+    {
+        bool appendFlag = isPaginationFetch;
+        std::vector<SoundResult> collected;
+        bool more = false;
+
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            if (threadShouldExit())
+                return;
+
+            juce::String urlStr;
+            if (similarSoundIdSnapshot > 0)
+            {
+                urlStr = "https://freesound.org/apiv2/sounds/" + juce::String (similarSoundIdSnapshot)
+                       + "/similar/?token=" + juce::URL::addEscapeChars (searchTokenSnapshot, true)
+                       + "&fields=id,name,duration,previews,username,pack,type,samplerate,bitdepth,channels,license,tags&page_size=40";
+            }
+            else
+            {
+                juce::String maxBoundStr = maxIsInfinitySnapshot ? "*" : juce::String (std::max (minDurSnapshot + 0.1, maxDurSnapshot), 2);
+                juce::String filterStr = "duration:[" + juce::String (minDurSnapshot, 2) + " TO " + maxBoundStr + "]";
+
+                if (channelFilterSnapshot == 2) filterStr += " channels:1";
+                else if (channelFilterSnapshot == 3) filterStr += " channels:2";
+
+                if (typeFilterSnapshot == 2)      filterStr += " NOT tag:loop";
+                else if (typeFilterSnapshot == 3) filterStr += " tag:loop";
+
+                urlStr = "https://freesound.org/apiv2/search/text/?query="
+                       + juce::URL::addEscapeChars (searchQuerySnapshot, true)
+                       + "&filter=" + juce::URL::addEscapeChars (filterStr, true)
+                       + "&token=" + juce::URL::addEscapeChars (searchTokenSnapshot, true)
+                       + "&fields=id,name,duration,previews,username,pack,type,samplerate,bitdepth,channels,license,tags&page_size=50&page="
+                       + juce::String (currentPage);
+            }
+
+            juce::URL url (urlStr);
+            auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                               .withConnectionTimeoutMs (10000);
+
+            juce::String response;
+            if (auto stream = url.createInputStream (options))
+                response = stream->readEntireStreamAsString();
+
+            if (threadShouldExit())
+                return;
+
+            auto varJson = juce::JSON::parse (response);
+            if (auto* obj = varJson.getDynamicObject())
+            {
+                auto nextVar = obj->getProperty ("next");
+                more = (similarSoundIdSnapshot == 0) && nextVar.isString() && nextVar.toString().isNotEmpty();
+
+                std::vector<SoundResult> rawBatch;
+                parseJsonIntoList (obj->getProperty ("results"), rawBatch);
+                filterAndAppendDiverseResults (collected, rawBatch);
+
+                // Если из-за пачки однотипных сэмплов одного автора осталось мало звуков, сразу подтягиваем ещё страницу
+                if (collected.size() >= 18 || !more || similarSoundIdSnapshot > 0)
+                    break;
+
+                ++currentPage;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (!collected.empty() || similarSoundIdSnapshot > 0)
+        {
+            juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
+            juce::MessageManager::callAsync ([safeThis, collected, appendFlag, more]() {
+                if (safeThis != nullptr)
+                    safeThis->applySearchResults (collected, appendFlag, more);
+            });
+            return;
         }
 
         juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
@@ -2661,27 +3332,28 @@ private:
     juce::TextEditor tokenInput;
     bool isEditingToken = true;
 
+    IconButton backHistoryButton { IconButton::BackArrow };
     juce::TextEditor searchInput;
-    IconButton searchButton     { IconButton::Search };
-    IconButton tagMenuButton    { IconButton::HashTag };
-    IconButton randomDiceButton { IconButton::Dice2D };
-    IconButton favFilterButton  { IconButton::Heart };
+    IconButton tagMenuButton     { IconButton::HashTag, true }; // Внутри поля поиска, без обводки
+    IconButton searchButton      { IconButton::Search };
+    IconButton randomDiceButton  { IconButton::Dice2D };
+    IconButton favFilterButton   { IconButton::Heart };
 
     juce::ComboBox channelBox;
     juce::ComboBox typeBox;
     juce::Slider durRangeSlider;
     juce::Label durValueLabel;
 
-    IconButton dirButton        { IconButton::Folder };
-    IconButton openFolderButton { IconButton::OpenExternal };
-    IconButton infoButton       { IconButton::Info };
+    IconButton dirButton         { IconButton::Folder };
+    IconButton openFolderButton  { IconButton::OpenExternal };
+    IconButton infoButton        { IconButton::Info };
 
     juce::TableListBox table;
     WaveformDisplay waveformDisplay;
 
-    IconButton playButton       { IconButton::Play };
-    IconButton pauseButton      { IconButton::Pause };
-    IconButton stopButton       { IconButton::Stop };
+    // Белые иконки транспорта без рамок
+    IconButton playPauseButton   { IconButton::PlayPause, true };
+    IconButton stopButton        { IconButton::Stop, true };
 
     juce::Slider pitchSlider;
     juce::ToggleButton normCheckbox;
@@ -2691,10 +3363,12 @@ private:
     juce::Label statusLabel;
 
     std::unique_ptr<juce::FileChooser> fileChooser;
-    std::unique_ptr<SampleDetailsOverlay> sampleDetailsOverlay;
     std::unique_ptr<InfoOverlay> infoOverlay;
     std::vector<SoundResult> results;
     juce::CriticalSection resultsLock;
+
+    SoundResult pinnedReferenceSound;
+    bool hasPinnedReference = false;
 
     juce::String searchTokenSnapshot;
     juce::String searchQuerySnapshot;
@@ -2711,6 +3385,7 @@ private:
     bool isPaginationFetch = false;
     bool hasMorePages = false;
     bool showingFavoritesOnly = false;
+    double lastSpaceBarTimeMs = 0.0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FreesoundMiniEditor)
 };
