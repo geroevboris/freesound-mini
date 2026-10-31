@@ -1,0 +1,41 @@
+name: Build VST3 for macOS
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup JUCE
+        run: |
+          git clone --depth 1 --branch master https://github.com/juce-framework/JUCE.git juce
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Xcode \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0"
+
+      - name: Build Plugins
+        run: |
+          cmake --build build --config Release --target FreesoundMini_VST3 FreesoundMini_AU
+
+      - name: Package Artifacts
+        run: |
+          mkdir -p output
+          cp -R build/FreesoundMini_artefacts/Release/VST3/FreesoundMini.vst3 output/ || true
+          cp -R build/FreesoundMini_artefacts/Release/AU/FreesoundMini.component output/ || true
+          cd output && zip -r ../FreesoundMini-macOS.zip .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreesoundMini-macOS
+          path: FreesoundMini-macOS.zip
