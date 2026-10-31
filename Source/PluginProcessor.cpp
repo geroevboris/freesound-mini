@@ -540,7 +540,7 @@ public:
         table.getHeader().addColumn ("NAME", 1, 195);
         table.getHeader().addColumn ("DUR", 2, 65);
         table.getHeader().addColumn ("STATUS", 3, 60);
-        table.setMultipleSelectionAllowed (false);
+        table.setMultipleSelectionEnabled (false);
         addAndMakeVisible (table);
 
         waveformDisplay.onClicked = [this] {
