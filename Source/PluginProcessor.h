@@ -1,5 +1,8 @@
 #pragma once
+
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_audio_formats/juce_audio_formats.h>
+#include <juce_audio_utils/juce_audio_utils.h>
 
 class FreesoundMiniAudioProcessor : public juce::AudioProcessor
 {
@@ -28,7 +31,7 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
-    void playPreview(const juce::File& file);
+    void playPreview (const juce::File& file);
     void stopPreview();
 
 private:
