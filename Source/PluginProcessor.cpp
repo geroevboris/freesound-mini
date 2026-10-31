@@ -153,11 +153,15 @@ public:
         }
     }
 
-    void playFromStart()
+    void playOrResume()
     {
         if (readerSource != nullptr)
         {
-            transportSource.setPosition (0.0);
+            double len = transportSource.getLengthInSeconds();
+            double pos = transportSource.getCurrentPosition();
+            if (len > 0.0 && pos >= len - 0.03)
+                transportSource.setPosition (0.0);
+
             transportSource.start();
         }
         else if (currentFile.existsAsFile())
@@ -166,9 +170,43 @@ public:
         }
     }
 
+    void pausePreview()
+    {
+        transportSource.stop();
+    }
+
     void stopPreview()
     {
         transportSource.stop();
+        transportSource.setPosition (0.0);
+    }
+
+    void seekToRelativePosition (float proportion)
+    {
+        proportion = juce::jlimit (0.0f, 1.0f, proportion);
+
+        if (readerSource == nullptr && currentFile.existsAsFile())
+            rebuildTransport (0.0, false);
+
+        double length = transportSource.getLengthInSeconds();
+        if (length > 0.0)
+        {
+            transportSource.setPosition (length * (double) proportion);
+            transportSource.start();
+        }
+    }
+
+    float getRelativePlayheadPosition() const
+    {
+        double length = transportSource.getLengthInSeconds();
+        if (length <= 0.0)
+            return 0.0f;
+        return (float) juce::jlimit (0.0, 1.0, transportSource.getCurrentPosition() / length);
+    }
+
+    bool isAudioPlaying() const
+    {
+        return transportSource.isPlaying();
     }
 
     void setGain (float g)
@@ -232,13 +270,122 @@ private:
 };
 
 //==============================================================================
-class WaveformDisplay : public juce::Component
+class IconButton : public juce::Button
 {
 public:
-    std::function<void()> onClicked;
-    std::function<void()> onDragged;
+    enum Type { Play, Pause, Stop, Search, Folder, OpenExternal, Info, Close };
 
-    WaveformDisplay() {}
+    explicit IconButton (Type t) : juce::Button (""), iconType (t) {}
+
+    void paintButton (juce::Graphics& g, bool isMouseOver, bool isButtonDown) override
+    {
+        auto b = getLocalBounds().toFloat().reduced (1.0f);
+
+        juce::Colour bg = juce::Colour (0xff16181d);
+        if (isButtonDown)      bg = juce::Colour (0xff24332c);
+        else if (isMouseOver)  bg = juce::Colour (0xff1e2229);
+
+        g.setColour (bg);
+        g.fillRoundedRectangle (b, 7.0f);
+
+        g.setColour (isMouseOver ? juce::Colour (0xff52b788).withAlpha (0.5f) : juce::Colour (0xff262930));
+        g.drawRoundedRectangle (b, 7.0f, 1.0f);
+
+        juce::Colour iconCol = isButtonDown ? juce::Colour (0xff52b788)
+                             : (isMouseOver ? juce::Colour (0xff74c69d) : juce::Colours::lightgrey);
+        g.setColour (iconCol);
+
+        auto cx = b.getCentreX();
+        auto cy = b.getCentreY();
+        auto s = std::min (b.getWidth(), b.getHeight()) * 0.28f;
+
+        juce::Path p;
+        switch (iconType)
+        {
+            case Play:
+                p.addTriangle (cx - s * 0.7f, cy - s, cx - s * 0.7f, cy + s, cx + s * 1.1f, cy);
+                g.fillPath (p);
+                break;
+
+            case Pause:
+                g.fillRoundedRectangle (cx - s * 0.85f, cy - s, s * 0.55f, s * 2.0f, 1.5f);
+                g.fillRoundedRectangle (cx + s * 0.30f, cy - s, s * 0.55f, s * 2.0f, 1.5f);
+                break;
+
+            case Stop:
+                g.fillRoundedRectangle (cx - s * 0.85f, cy - s * 0.85f, s * 1.7f, s * 1.7f, 2.0f);
+                break;
+
+            case Search:
+                p.addEllipse (cx - s * 0.9f, cy - s * 0.9f, s * 1.4f, s * 1.4f);
+                p.startNewSubPath (cx + s * 0.3f, cy + s * 0.3f);
+                p.lineTo (cx + s * 1.0f, cy + s * 1.0f);
+                g.strokePath (p, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                break;
+
+            case Folder:
+                p.startNewSubPath (cx - s * 1.1f, cy - s * 0.7f);
+                p.lineTo (cx - s * 0.2f, cy - s * 0.7f);
+                p.lineTo (cx + s * 0.1f, cy - s * 0.35f);
+                p.lineTo (cx + s * 1.1f, cy - s * 0.35f);
+                p.lineTo (cx + s * 1.1f, cy + s * 0.8f);
+                p.lineTo (cx - s * 1.1f, cy + s * 0.8f);
+                p.closeSubPath();
+                g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                break;
+
+            case OpenExternal:
+                p.startNewSubPath (cx + s * 0.1f, cy - s * 0.8f);
+                p.lineTo (cx + s * 0.9f, cy - s * 0.8f);
+                p.lineTo (cx + s * 0.9f, cy);
+                p.startNewSubPath (cx + s * 0.9f, cy - s * 0.8f);
+                p.lineTo (cx - s * 0.3f, cy + s * 0.4f);
+                p.startNewSubPath (cx, cy - s * 0.5f);
+                p.lineTo (cx - s * 0.8f, cy - s * 0.5f);
+                p.lineTo (cx - s * 0.8f, cy + s * 0.8f);
+                p.lineTo (cx + s * 0.5f, cy + s * 0.8f);
+                p.lineTo (cx + s * 0.5f, cy + s * 0.1f);
+                g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                break;
+
+            case Info:
+                g.drawEllipse (cx - s, cy - s, s * 2.0f, s * 2.0f, 1.5f);
+                g.fillEllipse (cx - 1.2f, cy - s * 0.55f, 2.4f, 2.4f);
+                g.fillRoundedRectangle (cx - 1.0f, cy - s * 0.1f, 2.0f, s * 0.75f, 1.0f);
+                break;
+
+            case Close:
+                p.startNewSubPath (cx - s * 0.7f, cy - s * 0.7f);
+                p.lineTo (cx + s * 0.7f, cy + s * 0.7f);
+                p.startNewSubPath (cx + s * 0.7f, cy - s * 0.7f);
+                p.lineTo (cx - s * 0.7f, cy + s * 0.7f);
+                g.strokePath (p, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                break;
+        }
+    }
+
+private:
+    Type iconType;
+};
+
+//==============================================================================
+class WaveformDisplay : public juce::Component,
+                        private juce::Timer
+{
+public:
+    std::function<void(float)> onSeekRequested;
+    std::function<void()> onDragged;
+    std::function<float()> getPlayheadPos;
+
+    WaveformDisplay()
+    {
+        startTimerHz (30);
+    }
+
+    ~WaveformDisplay() override
+    {
+        stopTimer();
+    }
 
     void setWaveformData (const juce::AudioBuffer<float>& newBuffer)
     {
@@ -246,19 +393,17 @@ public:
         repaint();
     }
 
-    void mouseDown (const juce::MouseEvent&) override
+    void mouseDown (const juce::MouseEvent& e) override
     {
         dragStarted = false;
-    }
-
-    void mouseUp (const juce::MouseEvent& e) override
-    {
-        if (!dragStarted && e.getDistanceFromDragStart() < 6)
+        if (e.mods.isLeftButtonDown() && localBuffer.getNumSamples() > 0)
         {
-            if (onClicked)
-                onClicked();
+            float prop = juce::jlimit (0.0f, 1.0f, (float) e.x / (float) std::max (1, getWidth()));
+            lastCursorProp = prop;
+            if (onSeekRequested)
+                onSeekRequested (prop);
+            repaint();
         }
-        dragStarted = false;
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -271,17 +416,26 @@ public:
         }
     }
 
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        dragStarted = false;
+    }
+
     void paint (juce::Graphics& g) override
     {
-        g.setColour (juce::Colour (0xff141517));
-        g.fillRoundedRectangle (getLocalBounds().toFloat(), 10.0f);
+        auto b = getLocalBounds().toFloat();
+        g.setColour (juce::Colour (0xff121418));
+        g.fillRoundedRectangle (b, 12.0f);
+
+        g.setColour (juce::Colour (0xff22262e));
+        g.drawRoundedRectangle (b.reduced (0.5f), 12.0f, 1.0f);
 
         if (localBuffer.getNumSamples() == 0)
         {
-            g.setColour (juce::Colours::grey.withAlpha (0.6f));
+            g.setColour (juce::Colours::grey.withAlpha (0.55f));
             g.drawText ("No Audio Loaded", getLocalBounds().withTrimmedBottom (18), juce::Justification::centred);
-            g.drawText ("(Click waveform to play, hold & drag into project)",
-                        getLocalBounds().removeFromBottom (18), juce::Justification::centred);
+            g.drawText ("(Click anywhere to play/seek, hold & drag to Ableton)",
+                        getLocalBounds().removeFromBottom (20), juce::Justification::centred);
             return;
         }
 
@@ -296,7 +450,7 @@ public:
         juce::Path path;
         path.startNewSubPath (0.0f, midY);
 
-        const int numPoints = std::min (width, 160);
+        const int numPoints = std::min (width, 180);
         auto sampleChunk = (double) numSamples / (double) numPoints;
         auto xStep = (float) width / (float) numPoints;
 
@@ -319,7 +473,7 @@ public:
                 }
             }
 
-            float targetHeight = midY - (maxVal * midY * 0.78f);
+            float targetHeight = midY - (maxVal * midY * 0.76f);
             topPoints.push_back (targetHeight);
         }
 
@@ -345,29 +499,81 @@ public:
 
         path.closeSubPath();
 
-        juce::ColourGradient grad (juce::Colour (0xff2d6a4f), 0.0f, midY,
-                                   juce::Colour (0xff52b788), (float) width * 0.75f, midY, false);
+        juce::ColourGradient grad (juce::Colour (0xff2d6a4f), 0.0f, midY - height * 0.35f,
+                                   juce::Colour (0xff52b788), (float) width * 0.75f, midY + height * 0.35f, false);
         g.setGradientFill (grad);
         g.fillPath (path);
 
-        g.setColour (juce::Colours::white.withAlpha (0.45f));
-        g.drawText ("(Click waveform to play, hold & drag into project)",
+        // Отрисовка живого курсора воспроизведения
+        float cursorX = lastCursorProp * (float) width;
+        g.setColour (juce::Colours::white.withAlpha (0.85f));
+        g.drawVerticalLine ((int) std::round (cursorX), 4.0f, (float) height - 18.0f);
+        g.fillEllipse (cursorX - 3.0f, 3.0f, 6.0f, 6.0f);
+
+        g.setColour (juce::Colours::white.withAlpha (0.4f));
+        g.drawText ("(Click to seek, hold & drag into project)",
                     getLocalBounds().removeFromBottom (16), juce::Justification::centred);
     }
 
 private:
+    void timerCallback() override
+    {
+        if (getPlayheadPos && localBuffer.getNumSamples() > 0)
+        {
+            float newProp = getPlayheadPos();
+            if (std::abs (newProp - lastCursorProp) > 0.001f)
+            {
+                lastCursorProp = newProp;
+                repaint();
+            }
+        }
+    }
+
     juce::AudioBuffer<float> localBuffer;
+    float lastCursorProp = 0.0f;
     bool dragStarted = false;
 };
 
 //==============================================================================
-class CustomKnobLookAndFeel : public juce::LookAndFeel_V4
+class ModernLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
-    CustomKnobLookAndFeel()
+    ModernLookAndFeel()
     {
         setColour (juce::Slider::thumbColourId, juce::Colour (0xff52b788));
         setColour (juce::Slider::rotarySliderOutlineColourId, juce::Colour (0xff1a1c1e));
+        setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff14161a));
+        setColour (juce::TextEditor::textColourId, juce::Colours::white);
+        setColour (juce::TextEditor::outlineColourId, juce::Colour (0xff232730));
+        setColour (juce::TextEditor::focusedOutlineColourId, juce::Colour (0xff52b788));
+        setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff14161a));
+        setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff232730));
+        setColour (juce::ComboBox::textColourId, juce::Colours::lightgrey);
+        setColour (juce::ComboBox::arrowColourId, juce::Colour (0xff52b788));
+        setColour (juce::TableHeaderComponent::backgroundColourId, juce::Colour (0xff14161a));
+        setColour (juce::TableHeaderComponent::textColourId, juce::Colours::grey);
+        setColour (juce::TableHeaderComponent::outlineColourId, juce::Colour (0xff1f2229));
+        setColour (juce::TableListBox::backgroundColourId, juce::Colour (0xff0f1114));
+        setColour (juce::TableListBox::outlineColourId, juce::Colour (0xff1f2229));
+        setColour (juce::ToggleButton::tickColourId, juce::Colour (0xff52b788));
+    }
+
+    void fillTextEditorBackground (juce::Graphics& g, int width, int height, juce::TextEditor& textEditor) override
+    {
+        g.setColour (textEditor.findColour (juce::TextEditor::backgroundColourId));
+        g.fillRoundedRectangle (0.0f, 0.0f, (float) width, (float) height, 7.0f);
+    }
+
+    void drawTextEditorOutline (juce::Graphics& g, int width, int height, juce::TextEditor& textEditor) override
+    {
+        if (textEditor.isEnabled())
+        {
+            auto col = textEditor.hasKeyboardFocus (true)
+                     ? textEditor.findColour (juce::TextEditor::focusedOutlineColourId)
+                     : textEditor.findColour (juce::TextEditor::outlineColourId);
+            g.setColour (col);
+            g.drawRoundedRectangle (0.5f, 0.5f, (float) width - 1.0f, (float) height - 1.0f, 7.0f, 1.0f);
+        }
     }
 
     void drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height,
@@ -405,6 +611,48 @@ public:
         auto valText = juce::String ((int) std::round (slider.getValue())) + " st";
         g.drawText (valText, (int) (toX - radius), (int) (toY - 8.0f), (int) (radius * 2.0f), 16, juce::Justification::centred);
     }
+
+    void drawLinearSlider (juce::Graphics& g, int x, int y, int width, int height,
+                           float sliderPos, float minSliderPos, float maxSliderPos,
+                           const juce::Slider::SliderStyle style, juce::Slider& slider) override
+    {
+        if (style == juce::Slider::TwoValueHorizontal)
+        {
+            auto trackY = (float) y + (float) height * 0.5f;
+            float trackH = 4.0f;
+
+            g.setColour (juce::Colour (0xff1a1d24));
+            g.fillRoundedRectangle ((float) x, trackY - trackH * 0.5f, (float) width, trackH, 2.0f);
+
+            g.setColour (juce::Colour (0xff52b788));
+            float activeW = std::max (2.0f, maxSliderPos - minSliderPos);
+            g.fillRoundedRectangle (minSliderPos, trackY - trackH * 0.5f, activeW, trackH, 2.0f);
+
+            float r = 6.0f;
+            g.setColour (juce::Colours::white);
+            g.fillEllipse (minSliderPos - r, trackY - r, r * 2.0f, r * 2.0f);
+            g.fillEllipse (maxSliderPos - r, trackY - r, r * 2.0f, r * 2.0f);
+
+            g.setColour (juce::Colour (0xff52b788));
+            g.drawEllipse (minSliderPos - r, trackY - r, r * 2.0f, r * 2.0f, 2.0f);
+            g.drawEllipse (maxSliderPos - r, trackY - r, r * 2.0f, r * 2.0f, 2.0f);
+            return;
+        }
+
+        if (style == juce::Slider::LinearBar)
+        {
+            auto b = juce::Rectangle<int> (x, y, width, height).toFloat();
+            g.setColour (juce::Colour (0xff16181d));
+            g.fillRoundedRectangle (b, 5.0f);
+
+            float fillW = juce::jlimit (0.0f, b.getWidth(), sliderPos - (float) x);
+            g.setColour (juce::Colour (0xff52b788).withAlpha (0.75f));
+            g.fillRoundedRectangle (b.withWidth (fillW), 5.0f);
+            return;
+        }
+
+        LookAndFeel_V4::drawLinearSlider (g, x, y, width, height, sliderPos, minSliderPos, maxSliderPos, style, slider);
+    }
 };
 
 //==============================================================================
@@ -413,47 +661,56 @@ class InfoOverlay : public juce::Component
 public:
     explicit InfoOverlay (std::function<void()> closeCallback) : onClose (std::move (closeCallback))
     {
+        setInterceptsMouseClicks (true, true);
         closeButton.onClick = [this] { if (onClose) onClose(); };
         addAndMakeVisible (closeButton);
     }
 
+    void mouseDown (const juce::MouseEvent&) override
+    {
+        // Перехватываем клики, чтобы они не проваливались в таблицу под оверлеем
+    }
+
     void paint (juce::Graphics& g) override
     {
-        g.fillAll (juce::Colours::black.withAlpha (0.94f));
+        g.fillAll (juce::Colour (0xff0a0b0d).withAlpha (0.95f));
 
-        auto area = getLocalBounds().reduced (24);
+        auto card = getLocalBounds().reduced (18).toFloat();
+        g.setColour (juce::Colour (0xff14161a));
+        g.fillRoundedRectangle (card, 12.0f);
+        g.setColour (juce::Colour (0xff52b788).withAlpha (0.4f));
+        g.drawRoundedRectangle (card, 12.0f, 1.0f);
+
+        auto area = getLocalBounds().reduced (32);
         g.setColour (juce::Colour (0xff52b788));
-        g.drawText ("FREESOUND MINI", area.removeFromTop (35), juce::Justification::centredLeft);
+        g.drawText ("FREESOUND MINI — GUIDE", area.removeFromTop (32), juce::Justification::centredLeft);
 
         g.setColour (juce::Colours::lightgrey);
 
         juce::String text =
-            "Fast sound browser for Ableton Live.\n\n"
-            "1. API Token Setup:\n"
+            "1. API Key:\n"
             "   Get your free key at freesound.org/apiv2/apply/\n"
-            "   Paste it into 'Enter API Key'. [API OK] confirms connection.\n\n"
-            "2. Duration & Channel Filters:\n"
-            "   [All Ch / Mono / Stereo] filters by channel count.\n"
-            "   Max slider sets maximum sample duration in seconds.\n\n"
-            "3. Preview Controls:\n"
-            "   Samples play automatically when selected.\n"
-            "   [Norm -6dB] scales peak to -6 dBFS linearly without clipping.\n"
-            "   Pitch (-12..+12) resamples in real time and resets to 0 on next sound.\n\n"
-            "4. Drag-and-Drop:\n"
-            "   Click and hold directly on the green waveform and drag into Ableton Live.\n"
-            "   Exports original unmodified audio file.";
+            "   Paste it into the top bar. Green [✔ API OK] confirms it's saved.\n\n"
+            "2. Duration Range (Min — Max up to Infinity):\n"
+            "   Use the dual-thumb slider to cut both too-short and too-long sounds.\n"
+            "   Up to 60s it scales finely; past 1m it grows geometrically up to Infinity (∞).\n\n"
+            "3. Infinite Scroll:\n"
+            "   Scroll down the results table — new pages load automatically.\n\n"
+            "4. Waveform Seeking & Drag-and-Drop:\n"
+            "   Click anywhere on the green waveform to jump & play from that spot.\n"
+            "   Hold & drag from the waveform directly into Ableton Live.";
 
         g.drawFittedText (text, area, juce::Justification::topLeft, 24);
     }
 
     void resized() override
     {
-        closeButton.setBounds (getWidth() - 36, 12, 24, 24);
+        closeButton.setBounds (getWidth() - 52, 26, 26, 26);
     }
 
 private:
     std::function<void()> onClose;
-    juce::TextButton closeButton { "X" };
+    IconButton closeButton { IconButton::Close };
 };
 
 //==============================================================================
@@ -466,7 +723,7 @@ public:
     explicit FreesoundMiniEditor (FreesoundMiniAudioProcessor& p)
         : AudioProcessorEditor (&p), Thread ("FreesoundSearchThread"), proc (p)
     {
-        setSize (360, 560);
+        setLookAndFeel (&modernLF);
 
         if (proc.sampleDirectory == juce::File())
         {
@@ -509,15 +766,19 @@ public:
 
         infoButton.onClick = [this] {
             if (infoOverlay != nullptr)
+            {
+                infoOverlay->setBounds (getLocalBounds());
                 infoOverlay->setVisible (true);
+                infoOverlay->toFront (true);
+            }
         };
         addAndMakeVisible (infoButton);
 
         searchInput.setTextToShowWhenEmpty ("Search sounds (808, snare, ambient)...", juce::Colours::grey);
-        searchInput.onReturnKey = [this] { startSearch(); };
+        searchInput.onReturnKey = [this] { startNewSearch(); };
         addAndMakeVisible (searchInput);
 
-        searchButton.onClick = [this] { startSearch(); };
+        searchButton.onClick = [this] { startNewSearch(); };
         addAndMakeVisible (searchButton);
 
         channelBox.addItem ("All Ch", 1);
@@ -526,33 +787,45 @@ public:
         channelBox.setSelectedId (1, juce::dontSendNotification);
         addAndMakeVisible (channelBox);
 
-        durationSlider.setRange (1.0, 60.0, 1.0);
-        durationSlider.setValue (15.0);
-        durationSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 18);
-        durationSlider.setTextValueSuffix ("s");
-        addAndMakeVisible (durationSlider);
+        durRangeSlider.setSliderStyle (juce::Slider::TwoValueHorizontal);
+        durRangeSlider.setRange (0.0, 100.0, 0.1);
+        durRangeSlider.setMinAndMaxValues (0.0, 42.0, juce::dontSendNotification); // ~0.0s .. 30s по умолчанию
+        durRangeSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        durRangeSlider.onValueChange = [this] {
+            if (durRangeSlider.getMinValue() > durRangeSlider.getMaxValue())
+                durRangeSlider.setMinValue (durRangeSlider.getMaxValue(), juce::dontSendNotification);
+            updateDurationLabel();
+        };
+        addAndMakeVisible (durRangeSlider);
 
-        durationLabel.setText ("Max:", juce::dontSendNotification);
-        durationLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
-        addAndMakeVisible (durationLabel);
+        durValueLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+        durValueLabel.setJustificationType (juce::Justification::centredRight);
+        updateDurationLabel();
+        addAndMakeVisible (durValueLabel);
 
         table.setModel (this);
-        table.getHeader().addColumn ("NAME", 1, 195);
+        table.getHeader().addColumn ("NAME", 1, 210);
         table.getHeader().addColumn ("DUR", 2, 65);
-        table.getHeader().addColumn ("STATUS", 3, 60);
+        table.getHeader().addColumn ("STATUS", 3, 65);
         table.setMultipleSelectionEnabled (false);
         addAndMakeVisible (table);
 
-        waveformDisplay.onClicked = [this] {
-            proc.playFromStart();
+        waveformDisplay.onSeekRequested = [this] (float proportion) {
+            proc.seekToRelativePosition (proportion);
         };
         waveformDisplay.onDragged = [this] {
             startExternalDrag();
         };
+        waveformDisplay.getPlayheadPos = [this] {
+            return proc.getRelativePlayheadPosition();
+        };
         addAndMakeVisible (waveformDisplay);
 
-        playButton.onClick = [this] { proc.playFromStart(); };
+        playButton.onClick = [this] { proc.playOrResume(); };
         addAndMakeVisible (playButton);
+
+        pauseButton.onClick = [this] { proc.pausePreview(); };
+        addAndMakeVisible (pauseButton);
 
         stopButton.onClick = [this] { proc.stopPreview(); };
         addAndMakeVisible (stopButton);
@@ -562,7 +835,6 @@ public:
         pitchSlider.setValue (0.0);
         pitchSlider.setDoubleClickReturnValue (true, 0.0);
         pitchSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-        pitchSlider.setLookAndFeel (&knobLookAndFeel);
         pitchSlider.onValueChange = [this] { proc.setPitchSemitones (pitchSlider.getValue()); };
         addAndMakeVisible (pitchSlider);
 
@@ -590,13 +862,18 @@ public:
         addChildComponent (infoOverlay.get());
 
         refreshWaveformFromProcessor();
+
+        // Важно: setResizable и setSize вызываются строго в конце конструктора, когда все компоненты созданы
+        setResizable (true, true);
+        setResizeLimits (350, 520, 1000, 1200);
+        setSize (380, 600);
     }
 
     ~FreesoundMiniEditor() override
     {
         signalThreadShouldExit();
         stopThread (4000);
-        pitchSlider.setLookAndFeel (nullptr);
+        setLookAndFeel (nullptr);
     }
 
     void paint (juce::Graphics& g) override
@@ -608,56 +885,71 @@ public:
     {
         auto area = getLocalBounds().reduced (12);
 
-        auto topBar = area.removeFromTop (26);
-        infoButton.setBounds (topBar.removeFromRight (26));
+        // Верхняя панель: статус API, ключ и иконки папок/инфо
+        auto topBar = area.removeFromTop (28);
+        infoButton.setBounds (topBar.removeFromRight (28));
         topBar.removeFromRight (4);
-        openFolderButton.setBounds (topBar.removeFromRight (42));
+        openFolderButton.setBounds (topBar.removeFromRight (28));
         topBar.removeFromRight (4);
-        dirButton.setBounds (topBar.removeFromRight (52));
-        apiStatusLabel.setBounds (topBar.removeFromLeft (80));
+        dirButton.setBounds (topBar.removeFromRight (28));
+        topBar.removeFromRight (6);
+        apiStatusLabel.setBounds (topBar.removeFromLeft (78));
         topBar.removeFromLeft (4);
         tokenInput.setBounds (topBar);
 
-        area.removeFromTop (6);
+        area.removeFromTop (8);
 
-        auto searchRow = area.removeFromTop (28);
-        searchButton.setBounds (searchRow.removeFromRight (58));
-        searchRow.removeFromRight (4);
+        // Строка поиска
+        auto searchRow = area.removeFromTop (30);
+        searchButton.setBounds (searchRow.removeFromRight (34));
+        searchRow.removeFromRight (6);
         searchInput.setBounds (searchRow);
 
         area.removeFromTop (6);
 
+        // Панель фильтров: Каналы + Двухсторонний слайдер длительности (Min..Max..∞)
         auto filterRow = area.removeFromTop (24);
-        channelBox.setBounds (filterRow.removeFromLeft (85));
+        channelBox.setBounds (filterRow.removeFromLeft (82));
         filterRow.removeFromLeft (8);
-        durationLabel.setBounds (filterRow.removeFromLeft (35));
-        durationSlider.setBounds (filterRow);
+        durValueLabel.setBounds (filterRow.removeFromRight (105));
+        filterRow.removeFromRight (4);
+        durRangeSlider.setBounds (filterRow);
 
         area.removeFromTop (8);
 
-        auto bottomControl = area.removeFromBottom (46);
+        // Нижняя панель транспорта
+        auto bottomControl = area.removeFromBottom (48);
         area.removeFromBottom (6);
-        waveformDisplay.setBounds (area.removeFromBottom (75));
+
+        // Адаптивная высота волны при растягивании окна
+        int waveHeight = juce::jlimit (78, 170, getHeight() / 6);
+        waveformDisplay.setBounds (area.removeFromBottom (waveHeight));
 
         area.removeFromBottom (4);
-        statusLabel.setBounds (area.removeFromBottom (16));
+        statusLabel.setBounds (area.removeFromBottom (18));
 
+        // Таблица результатов
         table.setBounds (area);
+        int nameColW = std::max (140, table.getWidth() - 135);
+        table.getHeader().setColumnWidth (1, nameColW);
 
+        // Кнопки управления и ручка Pitch
         auto bArea = bottomControl;
-        playButton.setBounds (bArea.removeFromLeft (36));
+        playButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
         bArea.removeFromLeft (4);
-        stopButton.setBounds (bArea.removeFromLeft (36));
+        pauseButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
+        bArea.removeFromLeft (4);
+        stopButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
 
         bArea.removeFromLeft (8);
-        pitchSlider.setBounds (bArea.removeFromLeft (60));
-
-        bArea.removeFromLeft (8);
-        normCheckbox.setBounds (bArea.removeFromLeft (82));
+        pitchSlider.setBounds (bArea.removeFromLeft (56));
 
         bArea.removeFromLeft (6);
+        normCheckbox.setBounds (bArea.removeFromLeft (82));
+
+        bArea.removeFromLeft (4);
         volLabel.setBounds (bArea.removeFromLeft (22));
-        volSlider.setBounds (bArea);
+        volSlider.setBounds (bArea.reduced (0, 14));
 
         if (infoOverlay != nullptr)
             infoOverlay->setBounds (getLocalBounds());
@@ -672,31 +964,46 @@ public:
     void paintRowBackground (juce::Graphics& g, int, int, int, bool rowIsSelected) override
     {
         if (rowIsSelected)
-            g.fillAll (juce::Colour (0xff1f2a24));
+            g.fillAll (juce::Colour (0xff1d2b24));
         else
-            g.fillAll (juce::Colour (0xff111215));
+            g.fillAll (juce::Colour (0xff101216));
     }
 
     void paintCell (juce::Graphics& g, int rowNumber, int columnId, int width, int height, bool) override
     {
         SoundResult item;
+        bool shouldTriggerNextPage = false;
+
         {
             const juce::ScopedLock sl (resultsLock);
-            if (rowNumber < 0 || rowNumber >= static_cast<int> (results.size()))
+            int total = static_cast<int> (results.size());
+            if (rowNumber < 0 || rowNumber >= total)
                 return;
             item = results[static_cast<size_t> (rowNumber)];
+
+            if (rowNumber >= total - 5 && !isLoadingMore && hasMorePages)
+                shouldTriggerNextPage = true;
+        }
+
+        if (shouldTriggerNextPage)
+        {
+            juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
+            juce::MessageManager::callAsync ([safeThis]() {
+                if (safeThis != nullptr)
+                    safeThis->loadNextPageAsync();
+            });
         }
 
         g.setColour (juce::Colours::white);
 
         if (columnId == 1)
         {
-            g.drawText (item.name, 6, 0, width - 12, height, juce::Justification::centredLeft, true);
+            g.drawText (item.name, 8, 0, width - 12, height, juce::Justification::centredLeft, true);
         }
         else if (columnId == 2)
         {
             g.setColour (juce::Colours::grey);
-            g.drawText (juce::String (item.duration, 1) + "s", 0, 0, width, height, juce::Justification::centred);
+            g.drawText (formatSecondsCompact (item.duration), 0, 0, width, height, juce::Justification::centred);
         }
         else if (columnId == 3)
         {
@@ -733,18 +1040,26 @@ public:
         }
     }
 
-    void applySearchResults (const std::vector<SoundResult>& newResults)
+    void applySearchResults (const std::vector<SoundResult>& newResults, bool append, bool more)
     {
         {
             const juce::ScopedLock sl (resultsLock);
-            results = newResults;
+            if (append)
+                results.insert (results.end(), newResults.begin(), newResults.end());
+            else
+                results = newResults;
+
+            hasMorePages = more;
+            isLoadingMore = false;
         }
         table.updateContent();
-        statusLabel.setText ("Found: " + juce::String (getNumRows()) + " sounds", juce::dontSendNotification);
+        statusLabel.setText ("Loaded: " + juce::String (getNumRows()) + (hasMorePages ? "+ sounds (scroll for more)" : " sounds"),
+                             juce::dontSendNotification);
     }
 
     void applyStatusMessage (const juce::String& text)
     {
+        isLoadingMore = false;
         statusLabel.setText (text, juce::dontSendNotification);
     }
 
@@ -760,7 +1075,7 @@ public:
             table.repaintRow (index);
             proc.loadAndPlayFile (local, true);
             refreshWaveformFromProcessor();
-            statusLabel.setText ("Ready! Drag waveform to track.", juce::dontSendNotification);
+            statusLabel.setText ("Ready! Click waveform to seek or drag to Ableton.", juce::dontSendNotification);
         }
         else
         {
@@ -769,14 +1084,68 @@ public:
     }
 
 private:
-    void startSearch()
+    // Преобразование позиции ползунка [0..100] в секунды:
+    // 0..50 -> плавная шкала 0.0s .. 60.0s
+    // 50..99.5 -> геометрический рост после 1 минуты: 60 * 2^((t - 50) / 8.0) (до ~1 часа)
+    // >= 99.5 -> Бесконечность (∞)
+    static double sliderPosToSeconds (double pos, bool& isInfinity)
+    {
+        if (pos >= 99.5)
+        {
+            isInfinity = true;
+            return -1.0;
+        }
+        isInfinity = false;
+        if (pos <= 0.0)
+            return 0.0;
+        if (pos <= 50.0)
+        {
+            double norm = pos / 50.0;
+            return 60.0 * norm * norm; // квадратичная кривая для высокой точности на коротких звуках (0.1s..10s)
+        }
+        return 60.0 * std::pow (2.0, (pos - 50.0) / 8.0);
+    }
+
+    static juce::String formatSecondsCompact (double sec)
+    {
+        if (sec < 10.0)
+            return juce::String (sec, 1) + "s";
+        if (sec < 60.0)
+            return juce::String ((int) std::round (sec)) + "s";
+        int mins = (int) (sec / 60.0);
+        int remSec = (int) std::round (sec) % 60;
+        if (remSec == 0)
+            return juce::String (mins) + "m";
+        return juce::String (mins) + "m" + juce::String (remSec) + "s";
+    }
+
+    void updateDurationLabel()
+    {
+        bool minInf = false, maxInf = false;
+        double minS = sliderPosToSeconds (durRangeSlider.getMinValue(), minInf);
+        double maxS = sliderPosToSeconds (durRangeSlider.getMaxValue(), maxInf);
+
+        juce::String minText = minInf ? "∞" : formatSecondsCompact (minS);
+        juce::String maxText = maxInf ? "∞" : formatSecondsCompact (maxS);
+
+        durValueLabel.setText (minText + " - " + maxText, juce::dontSendNotification);
+    }
+
+    void startNewSearch()
     {
         if (isThreadRunning())
-            return;
+            stopThread (2000);
 
         searchTokenSnapshot = tokenInput.getText().trim();
         searchQuerySnapshot = searchInput.getText().trim();
-        maxDurationSnapshot = durationSlider.getValue();
+
+        bool minInf = false, maxInf = false;
+        minDurSnapshot = sliderPosToSeconds (durRangeSlider.getMinValue(), minInf);
+        if (minInf) minDurSnapshot = 0.0;
+
+        maxDurSnapshot = sliderPosToSeconds (durRangeSlider.getMaxValue(), maxInf);
+        maxIsInfinitySnapshot = maxInf;
+
         channelFilterSnapshot = channelBox.getSelectedId();
 
         if (searchTokenSnapshot.isEmpty())
@@ -791,7 +1160,30 @@ private:
         }
 
         lastTriggeredRow = -1;
+        currentPage = 1;
+        isPaginationFetch = false;
+        isLoadingMore = true;
+        hasMorePages = false;
+
+        {
+            const juce::ScopedLock sl (resultsLock);
+            results.clear();
+        }
+        table.updateContent();
+
         statusLabel.setText ("Searching...", juce::dontSendNotification);
+        startThread();
+    }
+
+    void loadNextPageAsync()
+    {
+        if (isLoadingMore || !hasMorePages || isThreadRunning())
+            return;
+
+        isLoadingMore = true;
+        isPaginationFetch = true;
+        ++currentPage;
+        statusLabel.setText ("Loading page " + juce::String (currentPage) + "...", juce::dontSendNotification);
         startThread();
     }
 
@@ -826,12 +1218,12 @@ private:
     {
         if (proc.savedToken.length() > 5)
         {
-            apiStatusLabel.setText ("API OK", juce::dontSendNotification);
+            apiStatusLabel.setText ("✔ API OK", juce::dontSendNotification);
             apiStatusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff52b788));
         }
         else
         {
-            apiStatusLabel.setText ("NO API", juce::dontSendNotification);
+            apiStatusLabel.setText ("✕ NO API", juce::dontSendNotification);
             apiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::indianred);
         }
     }
@@ -850,7 +1242,7 @@ private:
         {
             proc.loadAndPlayFile (existing, true);
             refreshWaveformFromProcessor();
-            statusLabel.setText ("Playing. Drag waveform to Ableton!", juce::dontSendNotification);
+            statusLabel.setText ("Playing. Click waveform to seek or drag to Ableton!", juce::dontSendNotification);
         }
         else
         {
@@ -860,15 +1252,21 @@ private:
 
     void run() override
     {
-        juce::String filterStr = "duration:[0.05 TO " + juce::String (maxDurationSnapshot, 1) + "]";
+        juce::String maxBoundStr = maxIsInfinitySnapshot ? "*" : juce::String ( std::max (minDurSnapshot + 0.1, maxDurSnapshot), 2 );
+        juce::String filterStr = "duration:[" + juce::String (minDurSnapshot, 2) + " TO " + maxBoundStr + "]";
+
         if (channelFilterSnapshot == 2) filterStr += " channels:1";
         else if (channelFilterSnapshot == 3) filterStr += " channels:2";
+
+        int pageToFetch = currentPage;
+        bool appendFlag = isPaginationFetch;
 
         auto urlStr = "https://freesound.org/apiv2/search/text/?query="
                     + juce::URL::addEscapeChars (searchQuerySnapshot, true)
                     + "&filter=" + juce::URL::addEscapeChars (filterStr, true)
                     + "&token=" + juce::URL::addEscapeChars (searchTokenSnapshot, true)
-                    + "&fields=id,name,duration,previews&page_size=40";
+                    + "&fields=id,name,duration,previews&page_size=40&page="
+                    + juce::String (pageToFetch);
 
         juce::URL url (urlStr);
         auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
@@ -884,6 +1282,9 @@ private:
         auto varJson = juce::JSON::parse (response);
         if (auto* obj = varJson.getDynamicObject())
         {
+            auto nextVar = obj->getProperty ("next");
+            bool more = nextVar.isString() && nextVar.toString().isNotEmpty();
+
             auto resultsVar = obj->getProperty ("results");
             if (resultsVar.isArray())
             {
@@ -916,9 +1317,9 @@ private:
                 }
 
                 juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
-                juce::MessageManager::callAsync ([safeThis, newResults]() {
+                juce::MessageManager::callAsync ([safeThis, newResults, appendFlag, more]() {
                     if (safeThis != nullptr)
-                        safeThis->applySearchResults (newResults);
+                        safeThis->applySearchResults (newResults, appendFlag, more);
                 });
                 return;
             }
@@ -978,29 +1379,29 @@ private:
     }
 
     FreesoundMiniAudioProcessor& proc;
+    ModernLookAndFeel modernLF;
 
     juce::TextEditor tokenInput;
     juce::Label apiStatusLabel;
     juce::TextEditor searchInput;
-    juce::TextButton searchButton { "Search" };
+    IconButton searchButton     { IconButton::Search };
 
     juce::ComboBox channelBox;
-    juce::Slider durationSlider;
-    juce::Label durationLabel;
+    juce::Slider durRangeSlider;
+    juce::Label durValueLabel;
 
-    juce::TextButton dirButton { "Folder" };
-    juce::TextButton openFolderButton { "Open" };
-    juce::TextButton infoButton { "i" };
+    IconButton dirButton        { IconButton::Folder };
+    IconButton openFolderButton { IconButton::OpenExternal };
+    IconButton infoButton       { IconButton::Info };
 
     juce::TableListBox table;
     WaveformDisplay waveformDisplay;
 
-    juce::TextButton playButton { "Play" };
-    juce::TextButton stopButton { "Stop" };
+    IconButton playButton       { IconButton::Play };
+    IconButton pauseButton      { IconButton::Pause };
+    IconButton stopButton       { IconButton::Stop };
 
     juce::Slider pitchSlider;
-    CustomKnobLookAndFeel knobLookAndFeel;
-
     juce::ToggleButton normCheckbox;
     juce::Slider volSlider;
     juce::Label volLabel;
@@ -1014,9 +1415,16 @@ private:
 
     juce::String searchTokenSnapshot;
     juce::String searchQuerySnapshot;
-    double maxDurationSnapshot = 15.0;
+    double minDurSnapshot = 0.0;
+    double maxDurSnapshot = 30.0;
+    bool maxIsInfinitySnapshot = false;
     int channelFilterSnapshot = 1;
     int lastTriggeredRow = -1;
+
+    int currentPage = 1;
+    bool isLoadingMore = false;
+    bool isPaginationFetch = false;
+    bool hasMorePages = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FreesoundMiniEditor)
 };
