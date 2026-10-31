@@ -20,10 +20,7 @@ juce_add_plugin(FreesoundMini
 )
 
 target_sources(FreesoundMini PRIVATE
-    Source/PluginProcessor.h
     Source/PluginProcessor.cpp
-    Source/PluginEditor.h
-    Source/PluginEditor.cpp
 )
 
 target_compile_definitions(FreesoundMini PRIVATE
