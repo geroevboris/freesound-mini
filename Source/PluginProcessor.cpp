@@ -24,6 +24,14 @@ public:
         : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true))
     {
         formatManager.registerBasicFormats();
+        loadGlobalSettings();
+
+        if (sampleDirectory == juce::File())
+        {
+            sampleDirectory = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
+                                  .getChildFile ("FreesoundSamples");
+        }
+        sampleDirectory.createDirectory();
     }
 
     ~FreesoundMiniAudioProcessor() override
@@ -31,6 +39,46 @@ public:
         transportSource.stop();
         transportSource.setSource (nullptr);
         readerSource.reset();
+    }
+
+    static juce::File getGlobalSettingsFile()
+    {
+        auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                       .getChildFile ("FreesoundMini");
+        dir.createDirectory();
+        return dir.getChildFile ("settings.xml");
+    }
+
+    void saveGlobalSettings()
+    {
+        juce::ValueTree tree ("FreesoundMiniGlobalSettings");
+        tree.setProperty ("apiToken", savedToken, nullptr);
+        tree.setProperty ("saveDirectory", sampleDirectory.getFullPathName(), nullptr);
+
+        if (auto xml = tree.createXml())
+            getGlobalSettingsFile().replaceWithText (xml->toString());
+    }
+
+    void loadGlobalSettings()
+    {
+        auto file = getGlobalSettingsFile();
+        if (file.existsAsFile())
+        {
+            if (auto xml = juce::XmlDocument::parse (file))
+            {
+                auto tree = juce::ValueTree::fromXml (*xml);
+                if (tree.isValid())
+                {
+                    auto tok = tree.getProperty ("apiToken", "").toString().trim();
+                    if (tok.isNotEmpty())
+                        savedToken = tok;
+
+                    auto dir = tree.getProperty ("saveDirectory", "").toString().trim();
+                    if (dir.isNotEmpty())
+                        sampleDirectory = juce::File (dir);
+                }
+            }
+        }
     }
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override
@@ -82,12 +130,21 @@ public:
             auto tree = juce::ValueTree::fromXml (*xmlState);
             if (tree.isValid())
             {
-                savedToken = tree.getProperty ("apiToken", "").toString();
-                auto dir = tree.getProperty ("saveDirectory", "").toString();
+                auto tok = tree.getProperty ("apiToken", "").toString().trim();
+                if (tok.isNotEmpty())
+                    savedToken = tok;
+
+                auto dir = tree.getProperty ("saveDirectory", "").toString().trim();
                 if (dir.isNotEmpty())
                     sampleDirectory = juce::File (dir);
+
+                saveGlobalSettings();
             }
         }
+
+        // Если проект перезаписал пустой токен, восстанавливаем из глобального конфига
+        if (savedToken.isEmpty())
+            loadGlobalSettings();
     }
 
     void loadAndPlayFile (const juce::File& file, bool resetPitchToZero)
@@ -204,11 +261,6 @@ public:
         return (float) juce::jlimit (0.0, 1.0, transportSource.getCurrentPosition() / length);
     }
 
-    bool isAudioPlaying() const
-    {
-        return transportSource.isPlaying();
-    }
-
     void setGain (float g)
     {
         previewGain = g;
@@ -267,6 +319,71 @@ private:
     juce::AudioTransportSource transportSource;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FreesoundMiniAudioProcessor)
+};
+
+//==============================================================================
+class ApiStatusBadge : public juce::Button
+{
+public:
+    ApiStatusBadge() : juce::Button ("") {}
+
+    void setConnected (bool connected)
+    {
+        if (isConnected != connected)
+        {
+            isConnected = connected;
+            repaint();
+        }
+    }
+
+    bool getConnected() const { return isConnected; }
+
+    void paintButton (juce::Graphics& g, bool isMouseOver, bool) override
+    {
+        auto b = getLocalBounds().toFloat().reduced (1.0f);
+
+        juce::Colour accent = isConnected ? juce::Colour (0xff52b788) : juce::Colours::indianred;
+        juce::Colour bg = isMouseOver ? juce::Colour (0xff1c2226) : juce::Colour (0xff14161a);
+
+        g.setColour (bg);
+        g.fillRoundedRectangle (b, 7.0f);
+
+        g.setColour (accent.withAlpha (isMouseOver ? 0.7f : 0.35f));
+        g.drawRoundedRectangle (b, 7.0f, 1.0f);
+
+        // Векторный кружок с галочкой или крестиком (без проблем с UTF-8 символами)
+        float cy = b.getCentreY();
+        float cx = b.getX() + 14.0f;
+        float r = 6.5f;
+
+        g.setColour (accent.withAlpha (0.2f));
+        g.fillEllipse (cx - r, cy - r, r * 2.0f, r * 2.0f);
+        g.setColour (accent);
+        g.drawEllipse (cx - r, cy - r, r * 2.0f, r * 2.0f, 1.2f);
+
+        juce::Path icon;
+        if (isConnected)
+        {
+            icon.startNewSubPath (cx - 3.2f, cy + 0.2f);
+            icon.lineTo (cx - 0.8f, cy + 2.6f);
+            icon.lineTo (cx + 3.4f, cy - 2.4f);
+        }
+        else
+        {
+            icon.startNewSubPath (cx - 2.5f, cy - 2.5f);
+            icon.lineTo (cx + 2.5f, cy + 2.5f);
+            icon.startNewSubPath (cx + 2.5f, cy - 2.5f);
+            icon.lineTo (cx - 2.5f, cy + 2.5f);
+        }
+        g.strokePath (icon, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        g.setColour (isConnected ? juce::Colour (0xff52b788) : juce::Colours::indianred);
+        juce::String labelText = isConnected ? (isMouseOver ? "API OK (Edit)" : "API OK") : "NO API";
+        g.drawText (labelText, (int) (cx + 10.0f), 0, getWidth() - (int) (cx + 14.0f), getHeight(), juce::Justification::centredLeft);
+    }
+
+private:
+    bool isConnected = false;
 };
 
 //==============================================================================
@@ -504,7 +621,6 @@ public:
         g.setGradientFill (grad);
         g.fillPath (path);
 
-        // Отрисовка живого курсора воспроизведения
         float cursorX = lastCursorProp * (float) width;
         g.setColour (juce::Colours::white.withAlpha (0.85f));
         g.drawVerticalLine ((int) std::round (cursorX), 4.0f, (float) height - 18.0f);
@@ -662,14 +778,18 @@ public:
     explicit InfoOverlay (std::function<void()> closeCallback) : onClose (std::move (closeCallback))
     {
         setInterceptsMouseClicks (true, true);
+
         closeButton.onClick = [this] { if (onClose) onClose(); };
         addAndMakeVisible (closeButton);
+
+        apiLink.setButtonText ("https://freesound.org/apiv2/apply/");
+        apiLink.setURL (juce::URL ("https://freesound.org/apiv2/apply/"));
+        apiLink.setJustificationType (juce::Justification::centredLeft);
+        apiLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff52b788));
+        addAndMakeVisible (apiLink);
     }
 
-    void mouseDown (const juce::MouseEvent&) override
-    {
-        // Перехватываем клики, чтобы они не проваливались в таблицу под оверлеем
-    }
+    void mouseDown (const juce::MouseEvent&) override {}
 
     void paint (juce::Graphics& g) override
     {
@@ -683,34 +803,45 @@ public:
 
         auto area = getLocalBounds().reduced (32);
         g.setColour (juce::Colour (0xff52b788));
-        g.drawText ("FREESOUND MINI — GUIDE", area.removeFromTop (32), juce::Justification::centredLeft);
+        g.drawText ("FREESOUND MINI - GUIDE", area.removeFromTop (32), juce::Justification::centredLeft);
 
         g.setColour (juce::Colours::lightgrey);
 
+        auto step1Top = area.removeFromTop (22);
+        g.drawText ("1. API Key (Saved Automatically):", step1Top, juce::Justification::centredLeft);
+
+        // Место под кликабельную гиперссылку
+        area.removeFromTop (24);
+
+        auto step1Bottom = area.removeFromTop (38);
+        g.drawFittedText ("Paste your key & press Enter. Input hides automatically. Click 'API OK' anytime to change it.",
+                          step1Bottom, juce::Justification::topLeft, 3);
+
+        area.removeFromTop (8);
+
         juce::String text =
-            "1. API Key:\n"
-            "   Get your free key at freesound.org/apiv2/apply/\n"
-            "   Paste it into the top bar. Green [✔ API OK] confirms it's saved.\n\n"
-            "2. Duration Range (Min — Max up to Infinity):\n"
-            "   Use the dual-thumb slider to cut both too-short and too-long sounds.\n"
-            "   Up to 60s it scales finely; past 1m it grows geometrically up to Infinity (∞).\n\n"
+            "2. Duration Range (Min - Max up to Infinity):\n"
+            "   Use the dual-thumb slider to filter out short or long sounds.\n"
+            "   Up to 60s it scales finely; past 1m it grows geometrically up to Infinity.\n\n"
             "3. Infinite Scroll:\n"
-            "   Scroll down the results table — new pages load automatically.\n\n"
+            "   Scroll down the results table - new pages load automatically.\n\n"
             "4. Waveform Seeking & Drag-and-Drop:\n"
             "   Click anywhere on the green waveform to jump & play from that spot.\n"
             "   Hold & drag from the waveform directly into Ableton Live.";
 
-        g.drawFittedText (text, area, juce::Justification::topLeft, 24);
+        g.drawFittedText (text, area, juce::Justification::topLeft, 20);
     }
 
     void resized() override
     {
         closeButton.setBounds (getWidth() - 52, 26, 26, 26);
+        apiLink.setBounds (32, 84, getWidth() - 64, 22);
     }
 
 private:
     std::function<void()> onClose;
     IconButton closeButton { IconButton::Close };
+    juce::HyperlinkButton apiLink;
 };
 
 //==============================================================================
@@ -725,23 +856,35 @@ public:
     {
         setLookAndFeel (&modernLF);
 
-        if (proc.sampleDirectory == juce::File())
-        {
-            proc.sampleDirectory = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
-                                       .getChildFile ("FreesoundSamples");
-        }
-        proc.sampleDirectory.createDirectory();
+        // Загружаем глобальные настройки на случай, если хост открыл новый экземпляр
+        if (proc.savedToken.isEmpty())
+            proc.loadGlobalSettings();
 
-        tokenInput.setTextToShowWhenEmpty ("Enter API Key...", juce::Colours::grey);
+        isEditingToken = (proc.savedToken.trim().length() <= 5);
+
+        tokenInput.setTextToShowWhenEmpty ("Paste API Key & press Enter...", juce::Colours::grey);
         tokenInput.setText (proc.savedToken, false);
         tokenInput.onTextChange = [this] {
             proc.savedToken = tokenInput.getText().trim();
-            updateAPIStatus();
+            proc.saveGlobalSettings();
+            apiStatusBadge.setConnected (proc.savedToken.length() > 5);
+        };
+        tokenInput.onReturnKey = [this] {
+            commitTokenAndHideIfValid();
+        };
+        tokenInput.onFocusLost = [this] {
+            commitTokenAndHideIfValid();
         };
         addAndMakeVisible (tokenInput);
 
-        updateAPIStatus();
-        addAndMakeVisible (apiStatusLabel);
+        apiStatusBadge.setConnected (proc.savedToken.trim().length() > 5);
+        apiStatusBadge.onClick = [this] {
+            isEditingToken = !isEditingToken;
+            updateTopBarVisibility();
+            if (isEditingToken)
+                tokenInput.grabKeyboardFocus();
+        };
+        addAndMakeVisible (apiStatusBadge);
 
         dirButton.onClick = [this] {
             fileChooser = std::make_unique<juce::FileChooser> ("Choose Sample Folder",
@@ -753,6 +896,7 @@ public:
                 if (result.isDirectory())
                 {
                     proc.sampleDirectory = result;
+                    proc.saveGlobalSettings();
                     statusLabel.setText ("Folder: " + result.getFileName(), juce::dontSendNotification);
                 }
             });
@@ -789,7 +933,7 @@ public:
 
         durRangeSlider.setSliderStyle (juce::Slider::TwoValueHorizontal);
         durRangeSlider.setRange (0.0, 100.0, 0.1);
-        durRangeSlider.setMinAndMaxValues (0.0, 42.0, juce::dontSendNotification); // ~0.0s .. 30s по умолчанию
+        durRangeSlider.setMinAndMaxValues (0.0, 42.0, juce::dontSendNotification);
         durRangeSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
         durRangeSlider.onValueChange = [this] {
             if (durRangeSlider.getMinValue() > durRangeSlider.getMaxValue())
@@ -800,6 +944,7 @@ public:
 
         durValueLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
         durValueLabel.setJustificationType (juce::Justification::centredRight);
+        durValueLabel.setBorderSize (juce::BorderSize<int> (0));
         updateDurationLabel();
         addAndMakeVisible (durValueLabel);
 
@@ -852,18 +997,21 @@ public:
 
         volLabel.setText ("Vol", juce::dontSendNotification);
         volLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+        volLabel.setBorderSize (juce::BorderSize<int> (0));
+        volLabel.setJustificationType (juce::Justification::centredLeft);
         addAndMakeVisible (volLabel);
 
         statusLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+        statusLabel.setBorderSize (juce::BorderSize<int> (0));
         addAndMakeVisible (statusLabel);
 
         infoOverlay = std::make_unique<InfoOverlay> ([this] { infoOverlay->setVisible (false); });
         infoOverlay->setVisible (false);
         addChildComponent (infoOverlay.get());
 
+        updateTopBarVisibility();
         refreshWaveformFromProcessor();
 
-        // Важно: setResizable и setSize вызываются строго в конце конструктора, когда все компоненты созданы
         setResizable (true, true);
         setResizeLimits (350, 520, 1000, 1200);
         setSize (380, 600);
@@ -885,7 +1033,6 @@ public:
     {
         auto area = getLocalBounds().reduced (12);
 
-        // Верхняя панель: статус API, ключ и иконки папок/инфо
         auto topBar = area.removeFromTop (28);
         infoButton.setBounds (topBar.removeFromRight (28));
         topBar.removeFromRight (4);
@@ -893,13 +1040,20 @@ public:
         topBar.removeFromRight (4);
         dirButton.setBounds (topBar.removeFromRight (28));
         topBar.removeFromRight (6);
-        apiStatusLabel.setBounds (topBar.removeFromLeft (78));
-        topBar.removeFromLeft (4);
-        tokenInput.setBounds (topBar);
+
+        if (tokenInput.isVisible())
+        {
+            apiStatusBadge.setBounds (topBar.removeFromLeft (86));
+            topBar.removeFromLeft (6);
+            tokenInput.setBounds (topBar);
+        }
+        else
+        {
+            apiStatusBadge.setBounds (topBar.removeFromLeft (115));
+        }
 
         area.removeFromTop (8);
 
-        // Строка поиска
         auto searchRow = area.removeFromTop (30);
         searchButton.setBounds (searchRow.removeFromRight (34));
         searchRow.removeFromRight (6);
@@ -907,33 +1061,28 @@ public:
 
         area.removeFromTop (6);
 
-        // Панель фильтров: Каналы + Двухсторонний слайдер длительности (Min..Max..∞)
         auto filterRow = area.removeFromTop (24);
         channelBox.setBounds (filterRow.removeFromLeft (82));
         filterRow.removeFromLeft (8);
-        durValueLabel.setBounds (filterRow.removeFromRight (105));
-        filterRow.removeFromRight (4);
+        durValueLabel.setBounds (filterRow.removeFromRight (96));
+        filterRow.removeFromRight (6);
         durRangeSlider.setBounds (filterRow);
 
         area.removeFromTop (8);
 
-        // Нижняя панель транспорта
         auto bottomControl = area.removeFromBottom (48);
         area.removeFromBottom (6);
 
-        // Адаптивная высота волны при растягивании окна
         int waveHeight = juce::jlimit (78, 170, getHeight() / 6);
         waveformDisplay.setBounds (area.removeFromBottom (waveHeight));
 
         area.removeFromBottom (4);
         statusLabel.setBounds (area.removeFromBottom (18));
 
-        // Таблица результатов
         table.setBounds (area);
         int nameColW = std::max (140, table.getWidth() - 135);
         table.getHeader().setColumnWidth (1, nameColW);
 
-        // Кнопки управления и ручка Pitch
         auto bArea = bottomControl;
         playButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
         bArea.removeFromLeft (4);
@@ -941,14 +1090,14 @@ public:
         bArea.removeFromLeft (4);
         stopButton.setBounds (bArea.removeFromLeft (32).withSizeKeepingCentre (32, 32));
 
-        bArea.removeFromLeft (8);
-        pitchSlider.setBounds (bArea.removeFromLeft (56));
-
         bArea.removeFromLeft (6);
-        normCheckbox.setBounds (bArea.removeFromLeft (82));
+        pitchSlider.setBounds (bArea.removeFromLeft (54));
 
         bArea.removeFromLeft (4);
-        volLabel.setBounds (bArea.removeFromLeft (22));
+        normCheckbox.setBounds (bArea.removeFromLeft (78));
+
+        bArea.removeFromLeft (4);
+        volLabel.setBounds (bArea.removeFromLeft (26));
         volSlider.setBounds (bArea.reduced (0, 14));
 
         if (infoOverlay != nullptr)
@@ -1084,10 +1233,29 @@ public:
     }
 
 private:
-    // Преобразование позиции ползунка [0..100] в секунды:
-    // 0..50 -> плавная шкала 0.0s .. 60.0s
-    // 50..99.5 -> геометрический рост после 1 минуты: 60 * 2^((t - 50) / 8.0) (до ~1 часа)
-    // >= 99.5 -> Бесконечность (∞)
+    void commitTokenAndHideIfValid()
+    {
+        proc.savedToken = tokenInput.getText().trim();
+        proc.saveGlobalSettings();
+
+        bool valid = (proc.savedToken.length() > 5);
+        apiStatusBadge.setConnected (valid);
+
+        if (valid)
+        {
+            isEditingToken = false;
+            updateTopBarVisibility();
+        }
+    }
+
+    void updateTopBarVisibility()
+    {
+        bool valid = (proc.savedToken.trim().length() > 5);
+        apiStatusBadge.setConnected (valid);
+        tokenInput.setVisible (!valid || isEditingToken);
+        resized();
+    }
+
     static double sliderPosToSeconds (double pos, bool& isInfinity)
     {
         if (pos >= 99.5)
@@ -1101,7 +1269,7 @@ private:
         if (pos <= 50.0)
         {
             double norm = pos / 50.0;
-            return 60.0 * norm * norm; // квадратичная кривая для высокой точности на коротких звуках (0.1s..10s)
+            return 60.0 * norm * norm;
         }
         return 60.0 * std::pow (2.0, (pos - 50.0) / 8.0);
     }
@@ -1125,8 +1293,9 @@ private:
         double minS = sliderPosToSeconds (durRangeSlider.getMinValue(), minInf);
         double maxS = sliderPosToSeconds (durRangeSlider.getMaxValue(), maxInf);
 
-        juce::String minText = minInf ? "∞" : formatSecondsCompact (minS);
-        juce::String maxText = maxInf ? "∞" : formatSecondsCompact (maxS);
+        const juce::String infSymbol (juce::CharPointer_UTF8 ("\xe2\x88\x9e"));
+        juce::String minText = minInf ? infSymbol : formatSecondsCompact (minS);
+        juce::String maxText = maxInf ? infSymbol : formatSecondsCompact (maxS);
 
         durValueLabel.setText (minText + " - " + maxText, juce::dontSendNotification);
     }
@@ -1136,7 +1305,10 @@ private:
         if (isThreadRunning())
             stopThread (2000);
 
-        searchTokenSnapshot = tokenInput.getText().trim();
+        if (tokenInput.isVisible())
+            commitTokenAndHideIfValid();
+
+        searchTokenSnapshot = proc.savedToken.trim();
         searchQuerySnapshot = searchInput.getText().trim();
 
         bool minInf = false, maxInf = false;
@@ -1150,6 +1322,8 @@ private:
 
         if (searchTokenSnapshot.isEmpty())
         {
+            isEditingToken = true;
+            updateTopBarVisibility();
             statusLabel.setText ("Paste API Key first!", juce::dontSendNotification);
             return;
         }
@@ -1214,20 +1388,6 @@ private:
         waveformDisplay.setWaveformData (temp);
     }
 
-    void updateAPIStatus()
-    {
-        if (proc.savedToken.length() > 5)
-        {
-            apiStatusLabel.setText ("✔ API OK", juce::dontSendNotification);
-            apiStatusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff52b788));
-        }
-        else
-        {
-            apiStatusLabel.setText ("✕ NO API", juce::dontSendNotification);
-            apiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::indianred);
-        }
-    }
-
     void triggerLoadAndPlay (int index)
     {
         juce::File existing;
@@ -1252,7 +1412,7 @@ private:
 
     void run() override
     {
-        juce::String maxBoundStr = maxIsInfinitySnapshot ? "*" : juce::String ( std::max (minDurSnapshot + 0.1, maxDurSnapshot), 2 );
+        juce::String maxBoundStr = maxIsInfinitySnapshot ? "*" : juce::String (std::max (minDurSnapshot + 0.1, maxDurSnapshot), 2);
         juce::String filterStr = "duration:[" + juce::String (minDurSnapshot, 2) + " TO " + maxBoundStr + "]";
 
         if (channelFilterSnapshot == 2) filterStr += " channels:1";
@@ -1381,8 +1541,10 @@ private:
     FreesoundMiniAudioProcessor& proc;
     ModernLookAndFeel modernLF;
 
+    ApiStatusBadge apiStatusBadge;
     juce::TextEditor tokenInput;
-    juce::Label apiStatusLabel;
+    bool isEditingToken = true;
+
     juce::TextEditor searchInput;
     IconButton searchButton     { IconButton::Search };
 
