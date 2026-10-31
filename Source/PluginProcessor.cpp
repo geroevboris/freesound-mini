@@ -44,7 +44,6 @@ struct SearchHistoryEntry
 };
 
 //==============================================================================
-// Источник аудио в оперативной памяти с поддержкой мгновенного Реверса и Лупа
 class MemoryBufferAudioSource : public juce::PositionableAudioSource
 {
 public:
@@ -70,11 +69,7 @@ public:
         }
     }
 
-    void setLoopingMode (bool shouldLoop)
-    {
-        looping.store (shouldLoop);
-    }
-
+    void setLoopingMode (bool shouldLoop) { looping.store (shouldLoop); }
     void prepareToPlay (int, double) override {}
     void releaseResources() override {}
 
@@ -115,10 +110,7 @@ public:
             srcIdx = juce::jlimit ((int64_t) 0, total - 1, srcIdx);
 
             for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
-            {
-                float sample = buffer.getSample (ch % numCh, (int) srcIdx);
-                info.buffer->setSample (ch, info.startSample + i, sample);
-            }
+                info.buffer->setSample (ch, info.startSample + i, buffer.getSample (ch % numCh, (int) srcIdx));
 
             ++pos;
         }
@@ -133,10 +125,7 @@ public:
         nextPlayPos.store (juce::jlimit ((int64_t) 0, std::max ((int64_t) 0, total), (int64_t) newPosition));
     }
 
-    juce::int64 getNextReadPosition() const override
-    {
-        return nextPlayPos.load();
-    }
+    juce::int64 getNextReadPosition() const override { return nextPlayPos.load(); }
 
     juce::int64 getTotalLength() const override
     {
@@ -144,10 +133,7 @@ public:
         return buffer.getNumSamples();
     }
 
-    bool isLooping() const override
-    {
-        return looping.load();
-    }
+    bool isLooping() const override { return looping.load(); }
 
 private:
     mutable juce::CriticalSection lock;
@@ -293,7 +279,6 @@ public:
     {
         const juce::ScopedLock sl (favLock);
         juce::ValueTree root ("FavoritesList");
-
         for (const auto& item : favoriteItems)
             root.appendChild (soundToValueTree (item), nullptr);
 
@@ -344,7 +329,6 @@ public:
     void setSoundFavorite (const SoundResult& sound, bool shouldBeFav)
     {
         auto favFile = getFavoriteFileFor (sound.id, sound.name);
-
         {
             const juce::ScopedLock sl (favLock);
             auto it = std::remove_if (favoriteItems.begin(), favoriteItems.end(),
@@ -362,10 +346,9 @@ public:
                 }
                 favoriteItems.push_back (copy);
             }
-            else
+            else if (favFile.existsAsFile())
             {
-                if (favFile.existsAsFile())
-                    favFile.deleteFile();
+                favFile.deleteFile();
             }
         }
         saveFavoritesIndex();
@@ -382,16 +365,12 @@ public:
         transportSource.prepareToPlay (samplesPerBlock, sampleRate);
     }
 
-    void releaseResources() override
-    {
-        transportSource.releaseResources();
-    }
+    void releaseResources() override { transportSource.releaseResources(); }
 
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
     {
         juce::ScopedNoDenormals noDenormals;
         buffer.clear();
-
         juce::AudioSourceChannelInfo channelInfo (&buffer, 0, buffer.getNumSamples());
         transportSource.getNextAudioBlock (channelInfo);
     }
@@ -410,7 +389,6 @@ public:
     const juce::String getProgramName (int) override { return {}; }
     void changeProgramName (int, const juce::String&) override {}
 
-    // Сохранение индивидуального состояния каждого плагина на дорожке
     void getStateInformation (juce::MemoryBlock& destData) override
     {
         juce::ValueTree tree ("FreesoundMiniInstanceState");
@@ -601,10 +579,7 @@ public:
         }
     }
 
-    void pausePreview()
-    {
-        transportSource.stop();
-    }
+    void pausePreview() { transportSource.stop(); }
 
     void stopPreview()
     {
@@ -612,15 +587,11 @@ public:
         transportSource.setPosition (0.0);
     }
 
-    bool isAudioPlaying() const
-    {
-        return transportSource.isPlaying();
-    }
+    bool isAudioPlaying() const { return transportSource.isPlaying(); }
 
     void seekToVisualProportion (float visualProp)
     {
         visualProp = juce::jlimit (0.0f, 1.0f, visualProp);
-
         if (memorySource == nullptr || memorySource->getTotalLength() <= 0)
             return;
 
@@ -643,12 +614,7 @@ public:
         return (playbackMode == ModeReverse) ? (1.0f - raw) : raw;
     }
 
-    void setGain (float g)
-    {
-        previewGain = g;
-        updateGainInternal();
-    }
-
+    void setGain (float g) { previewGain = g; updateGainInternal(); }
     float getGain() const { return previewGain; }
 
     void setPitchSemitones (double semitones)
@@ -666,12 +632,7 @@ public:
 
     double getPitchSemitones() const { return pitchSemitones; }
 
-    void setNormalization (bool shouldNormalize)
-    {
-        useNormalization = shouldNormalize;
-        updateGainInternal();
-    }
-
+    void setNormalization (bool shouldNormalize) { useNormalization = shouldNormalize; updateGainInternal(); }
     bool getNormalization() const { return useNormalization; }
 
     void copyCachedBuffer (juce::AudioBuffer<float>& dest)
@@ -683,7 +644,6 @@ public:
     juce::File getCurrentFile() const { return currentFile; }
     SoundResult getCurrentSampleMeta() const { return currentSampleMeta; }
 
-    // Персистентные данные экземпляра плагина (не сбрасываются при закрытии окна)
     juce::String savedToken;
     juce::File sampleDirectory;
 
@@ -714,7 +674,6 @@ private:
             return {};
 
         const float* data = buf.getReadPointer (0);
-
         const int winSize = std::min (numSamples, 4096);
         int bestStart = 0;
         float bestEnergy = 0.0f;
@@ -749,8 +708,7 @@ private:
             {
                 for (int lag = minLag; lag <= maxLag; ++lag)
                 {
-                    float corr = 0.0f;
-                    float rLag = 0.0f;
+                    float corr = 0.0f, rLag = 0.0f;
                     for (int i = 0; i < winSize / 2; ++i)
                     {
                         float a = data[bestStart + i];
@@ -830,7 +788,6 @@ private:
                 {
                     int minBpmLag = (int) ((60.0 / 175.0) * envRate);
                     int maxBpmLag = std::min (halfFrames - 1, (int) ((60.0 / 70.0) * envRate));
-
                     float bestBpmCorr = 0.0f;
                     int bestBpmLag = 0;
 
@@ -917,16 +874,11 @@ struct HeartRenderer
             g.strokePath (p, juce::PathStrokeType (3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
+        g.setColour (sage);
         if (isFilled)
-        {
-            g.setColour (sage);
             g.fillPath (p);
-        }
         else
-        {
-            g.setColour (sage);
             g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-        }
     }
 };
 
@@ -948,13 +900,11 @@ public:
     void paintButton (juce::Graphics& g, bool isMouseOver, bool) override
     {
         auto b = getLocalBounds().toFloat().reduced (1.0f);
-
         juce::Colour accent = isConnected ? juce::Colour (0xff52b788) : juce::Colours::indianred;
         juce::Colour bg = isMouseOver ? juce::Colour (0xff1c2226) : juce::Colour (0xff14161a);
 
         g.setColour (bg);
         g.fillRoundedRectangle (b, 7.0f);
-
         g.setColour (accent.withAlpha (isMouseOver ? 0.7f : 0.35f));
         g.drawRoundedRectangle (b, 7.0f, 1.0f);
 
@@ -983,7 +933,7 @@ public:
         }
         g.strokePath (icon, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
-        g.setColour (isConnected ? juce::Colour (0xff52b788) : juce::Colours::indianred);
+        g.setColour (accent);
         juce::String labelText = isConnected ? (isMouseOver ? "API OK (Edit)" : "API OK") : "NO API";
         g.drawText (labelText, (int) (cx + 10.0f), 0, getWidth() - (int) (cx + 14.0f), getHeight(), juce::Justification::centredLeft);
     }
@@ -1074,12 +1024,12 @@ public:
         switch (iconType)
         {
             case PlayPause:
-                if (isActiveState) // В состоянии воспроизведения рисуем иконку Паузы
+                if (isActiveState)
                 {
                     g.fillRoundedRectangle (cx - s * 0.8f, cy - s * 0.95f, s * 0.52f, s * 1.9f, 1.5f);
                     g.fillRoundedRectangle (cx + s * 0.28f, cy - s * 0.95f, s * 0.52f, s * 1.9f, 1.5f);
                 }
-                else // В состоянии покоя рисуем чистый белый треугольник Play
+                else
                 {
                     p.addTriangle (cx - s * 0.65f, cy - s * 0.95f, cx - s * 0.65f, cy + s * 0.95f, cx + s * 1.05f, cy);
                     g.fillPath (p);
@@ -1107,7 +1057,7 @@ public:
                 break;
 
             case ModeCycle:
-                if (modeIndex == 0) // Стрелка вперёд (Normal)
+                if (modeIndex == 0)
                 {
                     p.startNewSubPath (cx - s * 0.95f, cy);
                     p.lineTo (cx + s * 0.85f, cy);
@@ -1116,7 +1066,7 @@ public:
                     p.lineTo (cx + s * 0.25f, cy + s * 0.6f);
                     g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
                 }
-                else if (modeIndex == 1) // Стрелка назад (Reverse)
+                else if (modeIndex == 1)
                 {
                     p.startNewSubPath (cx + s * 0.95f, cy);
                     p.lineTo (cx - s * 0.85f, cy);
@@ -1125,7 +1075,7 @@ public:
                     p.lineTo (cx - s * 0.25f, cy + s * 0.6f);
                     g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
                 }
-                else // Замкнутая стрелка (Loop)
+                else
                 {
                     p.addCentredArc (cx, cy, s * 0.85f, s * 0.85f, 0.0f, 0.4f, juce::MathConstants<float>::twoPi - 0.35f, true);
                     p.startNewSubPath (cx + s * 0.3f, cy - s * 0.95f);
@@ -1219,27 +1169,26 @@ private:
 };
 
 //==============================================================================
-// Всплывающий паспорт сэмпла (CallOutBox), открывающийся правее плагина и закрывающийся по клику мимо
+// Компактная карточка паспорта сэмпла (в 1.5 раза меньше, без стрелочки)
 class SamplePassportPopup : public juce::Component
 {
 public:
     SamplePassportPopup (const SoundResult& s,
-                         bool compactMode,
                          std::function<void(const juce::String&)> tagCallback,
                          std::function<void(const SoundResult&)> similarCallback)
-        : sound (s), isCompact (compactMode),
+        : sound (s),
           onTagClick (std::move (tagCallback)),
           onSimilarClick (std::move (similarCallback))
     {
         if (sound.license.isNotEmpty())
         {
-            juce::String shortLic = "Creative Commons License";
+            juce::String shortLic = "CC License";
             if (sound.license.containsIgnoreCase ("zero") || sound.license.contains ("cc0"))
-                shortLic = "CC0 1.0 (Public Domain)";
+                shortLic = "CC0 (Public Domain)";
             else if (sound.license.contains ("by-nc"))
-                shortLic = "CC BY-NC (Non-Commercial)";
+                shortLic = "CC BY-NC";
             else if (sound.license.contains ("by"))
-                shortLic = "CC BY (Attribution)";
+                shortLic = "CC BY";
 
             licenseLink.setButtonText (shortLic);
             licenseLink.setURL (juce::URL (sound.license));
@@ -1261,7 +1210,7 @@ public:
         };
         addAndMakeVisible (similarBtn);
 
-        int maxTags = isCompact ? std::min (6, sound.tags.size()) : std::min (10, sound.tags.size());
+        int maxTags = std::min (6, sound.tags.size());
         for (int i = 0; i < maxTags; ++i)
         {
             auto tagStr = sound.tags[i].trim();
@@ -1282,93 +1231,70 @@ public:
             }
         }
 
-        setSize (isCompact ? 255 : 295, isCompact ? 195 : 265);
+        setSize (215, 168);
     }
 
     void paint (juce::Graphics& g) override
     {
-        g.fillAll (juce::Colour (0xff121418));
-
-        int pad = 12;
+        g.setFont (12.0f);
+        int pad = 10;
         int w = getWidth() - pad * 2;
 
-        g.setColour (juce::Colour (0xff52b788));
-        g.drawText (isCompact ? "QUICK INFO" : "SAMPLE PASSPORT", pad, 8, w, 18, juce::Justification::centredLeft);
-
         g.setColour (juce::Colours::white);
-        g.drawText (sound.name, pad, 28, w, 20, juce::Justification::centredLeft, true);
+        g.drawText (sound.name, pad, 8, w, 16, juce::Justification::centredLeft, true);
 
         g.setColour (juce::Colours::grey);
-        juce::String authorLine = "By @" + (sound.username.isNotEmpty() ? sound.username : "unknown")
-                                + "  |  #" + juce::String (sound.id);
-        g.drawText (authorLine, pad, 48, w, 18, juce::Justification::centredLeft, true);
+        g.drawText ("@" + (sound.username.isNotEmpty() ? sound.username : "unknown") + " | #" + juce::String (sound.id),
+                    pad, 25, w, 15, juce::Justification::centredLeft, true);
 
         juce::String specs = (sound.formatType.isNotEmpty() ? sound.formatType.toUpperCase() : "AUDIO");
         if (sound.sampleRate > 0)
-            specs += " | " + juce::String (sound.sampleRate / 1000.0, 1) + " kHz";
+            specs += " | " + juce::String (sound.sampleRate / 1000.0, 1) + "k";
         if (sound.bitDepth > 0)
-            specs += " | " + juce::String (sound.bitDepth) + "-bit";
+            specs += " | " + juce::String (sound.bitDepth) + "b";
         if (sound.channels > 0)
             specs += " | " + juce::String (sound.channels == 1 ? "Mono" : "Stereo");
 
         g.setColour (juce::Colours::lightgrey);
-        g.drawText (specs, pad, 68, w, 18, juce::Justification::centredLeft, true);
-
-        int nextY = 88;
-        if (!isCompact && sound.detectedBpmKey.isNotEmpty())
-        {
-            g.setColour (juce::Colour (0xff52b788));
-            g.drawText ("Analysis: " + sound.detectedBpmKey, pad, nextY, w, 18, juce::Justification::centredLeft);
-            nextY += 20;
-        }
+        g.drawText (specs, pad, 42, w, 15, juce::Justification::centredLeft, true);
 
         g.setColour (juce::Colours::grey);
-        g.drawText ("License:", pad, nextY, 54, 20, juce::Justification::centredLeft);
-
-        if (!isCompact)
-        {
-            g.setColour (juce::Colour (0xff52b788));
-            g.drawText ("TAGS (Click to search):", pad, nextY + 56, w, 18, juce::Justification::centredLeft);
-        }
+        g.drawText ("License:", pad, 59, 48, 16, juce::Justification::centredLeft);
     }
 
     void resized() override
     {
-        int pad = 12;
+        int pad = 10;
         int w = getWidth() - pad * 2;
-        int licY = (!isCompact && sound.detectedBpmKey.isNotEmpty()) ? 108 : 88;
 
         if (licenseLink.isVisible())
-            licenseLink.setBounds (pad + 54, licY, w - 54, 20);
+            licenseLink.setBounds (pad + 48, 59, w - 48, 16);
 
-        int btnY = licY + 24;
-        similarBtn.setBounds (pad, btnY, w, 26);
+        similarBtn.setBounds (pad, 80, w, 22);
 
-        int tagsStartY = isCompact ? (btnY + 32) : (btnY + 52);
         int x = pad;
-        int y = tagsStartY;
+        int y = 108;
         int maxX = getWidth() - pad;
 
         for (auto& btn : tagButtons)
         {
-            int bw = std::min (130, std::max (48, (int) btn->getButtonText().length() * 7 + 16));
+            int bw = std::min (95, std::max (42, (int) btn->getButtonText().length() * 6 + 12));
             if (x + bw > maxX)
             {
                 x = pad;
-                y += 25;
+                y += 23;
             }
-            if (y + 22 <= getHeight() - 4)
-                btn->setBounds (x, y, bw, 22);
+            if (y + 19 <= getHeight() - 5)
+                btn->setBounds (x, y, bw, 19);
             else
                 btn->setVisible (false);
 
-            x += bw + 5;
+            x += bw + 4;
         }
     }
 
 private:
     SoundResult sound;
-    bool isCompact = false;
     std::function<void(const juce::String&)> onTagClick;
     std::function<void(const SoundResult&)> onSimilarClick;
     juce::HyperlinkButton licenseLink;
@@ -1385,7 +1311,7 @@ public:
     std::function<void()> onDragged;
     std::function<float()> getPlayheadPos;
     std::function<bool()> getIsPlaying;
-    std::function<void(juce::Component*)> onSampleInfoClicked;
+    std::function<void()> onSampleInfoClicked;
     std::function<void()> onSampleFavClicked;
     std::function<void()> onModeCycleClicked;
     std::function<void()> onPlaybackStateChanged;
@@ -1398,16 +1324,13 @@ public:
         sampleFavBtn.onClick = [this] { if (onSampleFavClicked) onSampleFavClicked(); };
         addChildComponent (sampleFavBtn);
 
-        sampleInfoBtn.onClick = [this] { if (onSampleInfoClicked) onSampleInfoClicked (&sampleInfoBtn); };
+        sampleInfoBtn.onClick = [this] { if (onSampleInfoClicked) onSampleInfoClicked(); };
         addChildComponent (sampleInfoBtn);
 
         startTimerHz (30);
     }
 
-    ~WaveformDisplay() override
-    {
-        stopTimer();
-    }
+    ~WaveformDisplay() override { stopTimer(); }
 
     void setWaveformData (const juce::AudioBuffer<float>& newBuffer,
                           const juce::String& sampleTitle,
@@ -1429,15 +1352,8 @@ public:
         repaint();
     }
 
-    void updateFavoriteState (bool isFav)
-    {
-        sampleFavBtn.setActiveState (isFav);
-    }
-
-    void updateModeState (int modeIdx)
-    {
-        modeCycleBtn.setModeIndex (modeIdx);
-    }
+    void updateFavoriteState (bool isFav) { sampleFavBtn.setActiveState (isFav); }
+    void updateModeState (int modeIdx)    { modeCycleBtn.setModeIndex (modeIdx); }
 
     void resized() override
     {
@@ -1469,10 +1385,7 @@ public:
         }
     }
 
-    void mouseUp (const juce::MouseEvent&) override
-    {
-        dragStarted = false;
-    }
+    void mouseUp (const juce::MouseEvent&) override { dragStarted = false; }
 
     void paint (juce::Graphics& g) override
     {
@@ -1524,8 +1437,7 @@ public:
                 }
             }
 
-            float targetHeight = midY - (maxVal * midY * 0.74f);
-            topPoints.push_back (targetHeight);
+            topPoints.push_back (midY - (maxVal * midY * 0.74f));
         }
 
         for (size_t i = 1; i < topPoints.size(); ++i)
@@ -1719,8 +1631,7 @@ public:
 
         juce::Path p;
         auto pointerLength = radius - 7.0f;
-        auto pointerThickness = 2.0f;
-        p.addRectangle (-pointerThickness * 0.5f, -pointerLength, pointerThickness, pointerLength * 0.55f);
+        p.addRectangle (-1.0f, -pointerLength, 2.0f, pointerLength * 0.55f);
         p.applyTransform (juce::AffineTransform::rotation (angle).translated (toX, toY));
         g.setColour (juce::Colour (0xff52b788));
         g.fillPath (p);
@@ -1770,6 +1681,22 @@ public:
         }
 
         LookAndFeel_V4::drawLinearSlider (g, x, y, width, height, sliderPos, minSliderPos, maxSliderPos, style, slider);
+    }
+
+    // Чистая плоская карточка для CallOutBox без комиксной стрелочки
+    void drawCallOutBoxBackground (juce::CallOutBox& box, juce::Graphics& g,
+                                   const juce::Path&, juce::Image&) override
+    {
+        auto b = box.getLocalBounds().toFloat().reduced (1.0f);
+        g.setColour (juce::Colour (0xff121418));
+        g.fillRoundedRectangle (b, 10.0f);
+        g.setColour (juce::Colour (0xff52b788).withAlpha (0.55f));
+        g.drawRoundedRectangle (b, 10.0f, 1.0f);
+    }
+
+    int getCallOutBoxBorderSize (const juce::CallOutBox&) override
+    {
+        return 2;
     }
 };
 
@@ -1823,7 +1750,7 @@ public:
             "   Single Spacebar: Play / Pause. Double Spacebar: Stop & Reset.\n"
             "   Up / Down Arrows: Navigate & auto-preview sounds.\n\n"
             "4. Right-Click Menu & Reference Pinning:\n"
-            "   Right-click any row for Sample Info or Show Similar (pins [REF] at top).";
+            "   Right-click any row for Show Similar (pins [REF] at top) or Open in Browser.";
 
         g.drawFittedText (text, area, juce::Justification::topLeft, 20);
     }
@@ -1860,6 +1787,7 @@ public:
         isEditingToken = (proc.savedToken.trim().length() <= 5);
 
         tokenInput.setTextToShowWhenEmpty ("Paste API Key & press Enter...", juce::Colours::grey);
+        tokenInput.setJustification (juce::Justification::centredLeft);
         tokenInput.setText (proc.savedToken, false);
         tokenInput.onTextChange = [this] {
             proc.savedToken = tokenInput.getText().trim();
@@ -1915,13 +1843,15 @@ public:
         };
         addAndMakeVisible (infoButton);
 
-        // Кнопка возврата по истории поиска + Поле поиска с встроенным '#' внутри справа
         backHistoryButton.onClick = [this] { restorePreviousSearchFromHistory(); };
         backHistoryButton.setEnabled (!proc.searchHistory.empty());
         addAndMakeVisible (backHistoryButton);
 
+        // Идеально выровненный по вертикали текст в поле поиска с правым отступом под кнопку '#'
         searchInput.setTextToShowWhenEmpty ("Search sounds (808, vinyl, bowl)...", juce::Colours::grey);
-        searchInput.setIndents (8, 0);
+        searchInput.setJustification (juce::Justification::centredLeft);
+        searchInput.setIndents (6, 4);
+        searchInput.setBorder (juce::BorderSize<int> (1, 6, 1, 28));
         searchInput.setText (proc.persistedQuery, false);
         searchInput.onReturnKey = [this] { startNewSearch (true); };
         addAndMakeVisible (searchInput);
@@ -1938,7 +1868,6 @@ public:
         favFilterButton.onClick = [this] { toggleFavoritesView(); };
         addAndMakeVisible (favFilterButton);
 
-        // Панель фильтров с автоматическим обновлением поиска
         channelBox.addItem ("All Ch", 1);
         channelBox.addItem ("Mono", 2);
         channelBox.addItem ("Stereo", 3);
@@ -1969,7 +1898,7 @@ public:
             proc.persistedMinSlider = durRangeSlider.getMinValue();
             proc.persistedMaxSlider = durRangeSlider.getMaxValue();
             updateDurationLabel();
-            startTimer (280); // Автопоиск после окончания перетаскивания ползунка
+            startTimer (280);
         };
         addAndMakeVisible (durRangeSlider);
 
@@ -2023,14 +1952,13 @@ public:
                 table.repaint();
             }
         };
-        waveformDisplay.onSampleInfoClicked = [this] (juce::Component* anchorBtn) {
+        waveformDisplay.onSampleInfoClicked = [this] {
             auto cur = proc.getCurrentSampleMeta();
             if (cur.id > 0)
-                launchFloatingSamplePopup (cur, false, anchorBtn ? anchorBtn->getScreenBounds() : getScreenBounds());
+                launchFloatingSamplePopup (cur);
         };
         addAndMakeVisible (waveformDisplay);
 
-        // Единая белая кнопка Play/Pause без обводки + белая кнопка Stop без обводки
         playPauseButton.onClick = [this] {
             proc.togglePlayPause();
             playPauseButton.setActiveState (proc.isAudioPlaying());
@@ -2077,7 +2005,6 @@ public:
         infoOverlay->setVisible (false);
         addChildComponent (infoOverlay.get());
 
-        // Восстановление сохранённой выдачи для этого экземпляра плагина при открытии/разворачивании
         {
             const juce::ScopedLock sl (proc.stateLock);
             results = proc.persistedResults;
@@ -2111,7 +2038,6 @@ public:
         setLookAndFeel (nullptr);
     }
 
-    // Обработка Пробела (одиночный = Play/Pause, двойной = Stop) и стрелок вверх/вниз
     bool keyPressed (const juce::KeyPress& key) override
     {
         if (key == juce::KeyPress::spaceKey && !searchInput.hasKeyboardFocus (false) && !tokenInput.hasKeyboardFocus (false))
@@ -2179,7 +2105,6 @@ public:
 
         area.removeFromTop (8);
 
-        // Строка поиска: Назад (<-) + Поле поиска (с кнопкой # внутри справа) + Лупа + 2D Кубик + Сердце
         auto searchRow = area.removeFromTop (30);
         favFilterButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (4);
@@ -2221,7 +2146,6 @@ public:
         int nameColW = std::max (120, table.getWidth() - (28 + 58 + 56 + 18));
         table.getHeader().setColumnWidth (2, nameColW);
 
-        // Нижняя панель: белые иконки Play/Pause и Stop без обводки + Pitch + Norm + Vol
         auto bArea = bottomControl;
         playPauseButton.setBounds (bArea.removeFromLeft (30).withSizeKeepingCentre (28, 28));
         bArea.removeFromLeft (2);
@@ -2348,7 +2272,7 @@ public:
             const juce::ScopedLock sl (resultsLock);
             std::stable_sort (results.begin(), results.end(), [newSortColumnId, isForwards] (const SoundResult& a, const SoundResult& b) {
                 if (a.isPinnedRef != b.isPinnedRef)
-                    return a.isPinnedRef; // Закрепленный [REF] всегда остается первой строкой
+                    return a.isPinnedRef;
                 if (newSortColumnId == 3)
                     return isForwards ? (a.duration < b.duration) : (a.duration > b.duration);
                 if (newSortColumnId == 2)
@@ -2419,22 +2343,18 @@ public:
             item = results[static_cast<size_t> (rowNumber)];
         }
 
-        // Контекстное меню по правому клику (ПКМ) на звуке
+        // Лаконичное контекстное меню по ПКМ (без дублирующего инфо-окна)
         if (e.mods.isPopupMenu())
         {
             juce::PopupMenu m;
-            m.addItem (1, "Sample Info");
-            m.addItem (2, "Show Similar Sounds");
-            m.addItem (3, "Open on Freesound.org");
+            m.addItem (1, "Show Similar Sounds");
+            m.addItem (2, "Open on Freesound.org");
 
-            auto rowScreenRect = table.getRowPosition (rowNumber, true) + table.getScreenPosition();
             m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (e.getScreenX(), e.getScreenY(), 2, 2)),
-                             [this, item, rowScreenRect] (int res) {
+                             [this, item] (int res) {
                                  if (res == 1)
-                                     launchFloatingSamplePopup (item, true, rowScreenRect);
-                                 else if (res == 2)
                                      startSimilarSearchWithPinnedRef (item);
-                                 else if (res == 3 && item.id > 0)
+                                 else if (res == 2 && item.id > 0)
                                      juce::URL ("https://freesound.org/s/" + juce::String (item.id) + "/").launchInDefaultBrowser();
                              });
             return;
@@ -2482,7 +2402,6 @@ public:
                 }
             }
 
-            // Строгий отсев однотипных дубликатов (по префиксу имени без цифр и по автору)
             filterAndAppendDiverseResults (results, newResults);
 
             hasMorePages = more;
@@ -2597,7 +2516,7 @@ private:
         entry.page = currentPage;
         entry.hasMore = hasMorePages;
 
-        proc.searchHistory.push_back ( std::move (entry) );
+        proc.searchHistory.push_back (std::move (entry));
         if (proc.searchHistory.size() > 15)
             proc.searchHistory.erase (proc.searchHistory.begin());
 
@@ -2640,12 +2559,11 @@ private:
         statusLabel.setText ("Stepped back (" + juce::String (getNumRows()) + " sounds)", juce::dontSendNotification);
     }
 
-    // Всплывающий поп-ап паспорта, позиционирующийся у правой границы плагина
-    void launchFloatingSamplePopup (const SoundResult& s, bool compact, juce::Rectangle<int> targetScreenBounds)
+    // Компактный паспорт сэмпла: открывается выше волны и правее плагина, без стрелочки
+    void launchFloatingSamplePopup (const SoundResult& s)
     {
         auto content = std::make_unique<SamplePassportPopup> (
             s,
-            compact,
             [this] (const juce::String& clickedTag) {
                 pushCurrentStateToHistory();
                 showingFavoritesOnly = false;
@@ -2658,15 +2576,16 @@ private:
                 startSimilarSearchWithPinnedRef (refSound);
             });
 
-        auto editorScreen = getScreenBounds();
-        juce::Rectangle<int> rightEdgeAnchor (editorScreen.getRight() - 4,
-                                              targetScreenBounds.getCentreY() - 8,
-                                              6, 16);
+        auto waveScreen = waveformDisplay.getScreenBounds();
+        juce::Rectangle<int> upperRightAnchor (waveScreen.getRight() + 6,
+                                               waveScreen.getY() - 95,
+                                               2, 2);
 
-        juce::CallOutBox::launchAsynchronously (std::move (content), rightEdgeAnchor, nullptr);
+        auto& box = juce::CallOutBox::launchAsynchronously (std::move (content), upperRightAnchor, nullptr);
+        box.setLookAndFeel (&modernLF);
+        box.setArrowSize (0.0f);
     }
 
-    // Нормализация префикса имени (удаление цифр, расширений и символов), чтобы отсекать пачки вроде "DIZI FLUTE LOOP 01..13"
     static juce::String normalizeSeriesKey (const juce::String& rawName)
     {
         auto lower = rawName.toLowerCase();
@@ -2797,6 +2716,7 @@ private:
                             });
     }
 
+    // Мульти-категорийный хаотичный рандом по всей базе Freesound
     void startPureRandomSearch()
     {
         if (isThreadRunning())
@@ -2821,15 +2741,9 @@ private:
         hasPinnedReference = false;
         searchInput.clear();
 
-        static const char* randomSeeds[] = {
-            "a", "e", "i", "o", "u", "sound", "field", "synth", "percussion", "texture",
-            "recording", "ambient", "metal", "wood", "voice", "analog", "drum", "noise",
-            "water", "bass", "acoustic", "glitch", "space", "modular", "organic", "hit"
-        };
-
         auto& rng = juce::Random::getSystemRandom();
-        searchQuerySnapshot = randomSeeds[rng.nextInt (26)];
-        currentPage = 1 + rng.nextInt (8);
+        searchQuerySnapshot = "*";
+        currentPage = 1 + rng.nextInt (45);
 
         bool minInf = false, maxInf = false;
         minDurSnapshot = sliderPosToSeconds (durRangeSlider.getMinValue(), minInf);
@@ -2852,11 +2766,10 @@ private:
         }
         table.updateContent();
 
-        statusLabel.setText ("Rolling pure random sounds...", juce::dontSendNotification);
+        statusLabel.setText ("Rolling chaotic random sounds...", juce::dontSendNotification);
         startThread();
     }
 
-    // Закрепление референсного звука на первой строке [REF] (в стиле Ableton) и поиск похожих
     void startSimilarSearchWithPinnedRef (const SoundResult& refSound)
     {
         if (isThreadRunning())
@@ -3220,12 +3133,23 @@ private:
                 if (typeFilterSnapshot == 2)      filterStr += " NOT tag:loop";
                 else if (typeFilterSnapshot == 3) filterStr += " tag:loop";
 
-                urlStr = "https://freesound.org/apiv2/search/text/?query="
-                       + juce::URL::addEscapeChars (searchQuerySnapshot, true)
+                bool isChaosRandom = (searchQuerySnapshot == "*");
+                static const char* sortModes[] = { "created_desc", "downloads_desc", "rating_desc", "duration_desc" };
+                auto& rng = juce::Random::getSystemRandom();
+
+                juce::String qParam = isChaosRandom ? "" : juce::URL::addEscapeChars (searchQuerySnapshot, true);
+                juce::String sortParam = isChaosRandom
+                    ? (juce::String ("&group_by_pack=1&sort=") + sortModes[rng.nextInt (4)])
+                    : juce::String ("&group_by_pack=1");
+
+                int pageToUse = isChaosRandom ? (1 + rng.nextInt (45)) : currentPage;
+
+                urlStr = "https://freesound.org/apiv2/search/text/?query=" + qParam
                        + "&filter=" + juce::URL::addEscapeChars (filterStr, true)
+                       + sortParam
                        + "&token=" + juce::URL::addEscapeChars (searchTokenSnapshot, true)
                        + "&fields=id,name,duration,previews,username,pack,type,samplerate,bitdepth,channels,license,tags&page_size=50&page="
-                       + juce::String (currentPage);
+                       + juce::String (pageToUse);
             }
 
             juce::URL url (urlStr);
@@ -3249,7 +3173,6 @@ private:
                 parseJsonIntoList (obj->getProperty ("results"), rawBatch);
                 filterAndAppendDiverseResults (collected, rawBatch);
 
-                // Если из-за пачки однотипных сэмплов одного автора осталось мало звуков, сразу подтягиваем ещё страницу
                 if (collected.size() >= 18 || !more || similarSoundIdSnapshot > 0)
                     break;
 
@@ -3334,7 +3257,7 @@ private:
 
     IconButton backHistoryButton { IconButton::BackArrow };
     juce::TextEditor searchInput;
-    IconButton tagMenuButton     { IconButton::HashTag, true }; // Внутри поля поиска, без обводки
+    IconButton tagMenuButton     { IconButton::HashTag, true };
     IconButton searchButton      { IconButton::Search };
     IconButton randomDiceButton  { IconButton::Dice2D };
     IconButton favFilterButton   { IconButton::Heart };
@@ -3351,7 +3274,6 @@ private:
     juce::TableListBox table;
     WaveformDisplay waveformDisplay;
 
-    // Белые иконки транспорта без рамок
     IconButton playPauseButton   { IconButton::PlayPause, true };
     IconButton stopButton        { IconButton::Stop, true };
 
