@@ -15,15 +15,15 @@ juce_add_plugin(FreesoundMini
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     PLUGIN_MANUFACTURER_CODE PLab
     PLUGIN_CODE Fsmn
-    FORMATS VST3 AU Standalone
+    FORMATS VST3 AU
     PRODUCT_NAME "FreesoundMini"
 )
 
 target_sources(FreesoundMini PRIVATE
-    Source/PluginProcessor.cpp
     Source/PluginProcessor.h
-    Source/PluginEditor.cpp
+    Source/PluginProcessor.cpp
     Source/PluginEditor.h
+    Source/PluginEditor.cpp
 )
 
 target_compile_definitions(FreesoundMini PRIVATE
