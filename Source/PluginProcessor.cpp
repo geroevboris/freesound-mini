@@ -179,7 +179,7 @@ public:
 
     void setPitchSemitones (double semitones)
     {
-        if ( std::abs (pitchSemitones - semitones) < 0.001 )
+        if (std::abs (pitchSemitones - semitones) < 0.001)
             return;
 
         pitchSemitones = semitones;
@@ -210,7 +210,7 @@ public:
 private:
     void updateGainInternal()
     {
-        float normGain = useNormalization ? (0.501187f / loadedFilePeak) : 1.0f; // -6 dBFS
+        float normGain = useNormalization ? (0.501187f / loadedFilePeak) : 1.0f;
         transportSource.setGain (previewGain * normGain);
     }
 
@@ -279,9 +279,7 @@ public:
         if (localBuffer.getNumSamples() == 0)
         {
             g.setColour (juce::Colours::grey.withAlpha (0.6f));
-            g.setFont (12.0f);
             g.drawText ("No Audio Loaded", getLocalBounds().withTrimmedBottom (18), juce::Justification::centred);
-            g.setFont (9.5f);
             g.drawText ("(Click waveform to play, hold & drag into project)",
                         getLocalBounds().removeFromBottom (18), juce::Justification::centred);
             return;
@@ -353,7 +351,6 @@ public:
         g.fillPath (path);
 
         g.setColour (juce::Colours::white.withAlpha (0.45f));
-        g.setFont (9.0f);
         g.drawText ("(Click waveform to play, hold & drag into project)",
                     getLocalBounds().removeFromBottom (16), juce::Justification::centred);
     }
@@ -405,7 +402,6 @@ public:
         g.fillPath (p);
 
         g.setColour (juce::Colours::white);
-        g.setFont (11.0f);
         auto valText = juce::String ((int) std::round (slider.getValue())) + " st";
         g.drawText (valText, (int) (toX - radius), (int) (toY - 8.0f), (int) (radius * 2.0f), 16, juce::Justification::centred);
     }
@@ -427,27 +423,25 @@ public:
 
         auto area = getLocalBounds().reduced (24);
         g.setColour (juce::Colour (0xff52b788));
-        g.setFont (18.0f);
         g.drawText ("FREESOUND MINI", area.removeFromTop (35), juce::Justification::centredLeft);
 
-        g.setFont (12.0f);
         g.setColour (juce::Colours::lightgrey);
 
         juce::String text =
-            "Быстрый поиск звуков прямо в Ableton Live.\n\n"
-            "1. Подключение API Token:\n"
-            "   Получите бесплатный ключ (Client Secret / API Key) на freesound.org/apiv2/apply/.\n"
-            "   Вставьте в поле 'Enter API Key'. Зелёная плашка [✔ API OK] подтвердит ввод.\n\n"
-            "2. Фильтры длины и каналов:\n"
-            "   [All Ch / Mono / Stereo] фильтрует сэмплы по количеству каналов.\n"
-            "   Слайдер Max ограничивает максимальную длительность файла в секундах.\n\n"
-            "3. Предпрослушивание:\n"
-            "   Звук воспроизводится сразу при выборе строки или клике по волне.\n"
-            "   Нормализация [✔ Norm -6dB] выравнивает пик до -6 dBFS без клиппинга.\n"
-            "   Ручка Pitch (-12..+12) меняет тон в реальном времени и сбрасывается на 0 при смене звука.\n\n"
+            "Fast sound browser for Ableton Live.\n\n"
+            "1. API Token Setup:\n"
+            "   Get your free key at freesound.org/apiv2/apply/\n"
+            "   Paste it into 'Enter API Key'. [API OK] confirms connection.\n\n"
+            "2. Duration & Channel Filters:\n"
+            "   [All Ch / Mono / Stereo] filters by channel count.\n"
+            "   Max slider sets maximum sample duration in seconds.\n\n"
+            "3. Preview Controls:\n"
+            "   Samples play automatically when selected.\n"
+            "   [Norm -6dB] scales peak to -6 dBFS linearly without clipping.\n"
+            "   Pitch (-12..+12) resamples in real time and resets to 0 on next sound.\n\n"
             "4. Drag-and-Drop:\n"
-            "   Зажмите ЛКМ прямо на зеленой волне и перетащите звук на дорожку Ableton Live.\n"
-            "   Экспортируется чистый исходный файл.";
+            "   Click and hold directly on the green waveform and drag into Ableton Live.\n"
+            "   Exports original unmodified audio file.";
 
         g.drawFittedText (text, area, juce::Justification::topLeft, 24);
     }
@@ -617,10 +611,10 @@ public:
         auto topBar = area.removeFromTop (26);
         infoButton.setBounds (topBar.removeFromRight (26));
         topBar.removeFromRight (4);
-        openFolderButton.setBounds (topBar.removeFromRight (26));
+        openFolderButton.setBounds (topBar.removeFromRight (42));
         topBar.removeFromRight (4);
         dirButton.setBounds (topBar.removeFromRight (52));
-        apiStatusLabel.setBounds (topBar.removeFromLeft (88));
+        apiStatusLabel.setBounds (topBar.removeFromLeft (80));
         topBar.removeFromLeft (4);
         tokenInput.setBounds (topBar);
 
@@ -694,7 +688,6 @@ public:
         }
 
         g.setColour (juce::Colours::white);
-        g.setFont (11.5f);
 
         if (columnId == 1)
         {
@@ -737,6 +730,41 @@ public:
             lastTriggeredRow = rowNumber;
             pitchSlider.setValue (0.0, juce::dontSendNotification);
             triggerLoadAndPlay (rowNumber);
+        }
+    }
+
+    void applySearchResults (const std::vector<SoundResult>& newResults)
+    {
+        {
+            const juce::ScopedLock sl (resultsLock);
+            results = newResults;
+        }
+        table.updateContent();
+        statusLabel.setText ("Found: " + juce::String (getNumRows()) + " sounds", juce::dontSendNotification);
+    }
+
+    void applyStatusMessage (const juce::String& text)
+    {
+        statusLabel.setText (text, juce::dontSendNotification);
+    }
+
+    void finishDownloadForIndex (int index, const juce::File& local)
+    {
+        if (local.existsAsFile())
+        {
+            {
+                const juce::ScopedLock sl (resultsLock);
+                if (index >= 0 && index < static_cast<int> (results.size()))
+                    results[static_cast<size_t> (index)].localFile = local;
+            }
+            table.repaintRow (index);
+            proc.loadAndPlayFile (local, true);
+            refreshWaveformFromProcessor();
+            statusLabel.setText ("Ready! Drag waveform to track.", juce::dontSendNotification);
+        }
+        else
+        {
+            statusLabel.setText ("Download failed.", juce::dontSendNotification);
         }
     }
 
@@ -798,12 +826,12 @@ private:
     {
         if (proc.savedToken.length() > 5)
         {
-            apiStatusLabel.setText ("✔ API OK", juce::dontSendNotification);
+            apiStatusLabel.setText ("API OK", juce::dontSendNotification);
             apiStatusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff52b788));
         }
         else
         {
-            apiStatusLabel.setText ("✕ NO API", juce::dontSendNotification);
+            apiStatusLabel.setText ("NO API", juce::dontSendNotification);
             apiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::indianred);
         }
     }
@@ -888,24 +916,18 @@ private:
                 }
 
                 juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
-                juce::MessageManager::callAsync ([safeThis, res = std::move (newResults)]() mutable {
-                    if (safeThis == nullptr)
-                        return;
-                    {
-                        const juce::ScopedLock sl (safeThis->resultsLock);
-                        safeThis->results = std::move (res);
-                    }
-                    safeThis->table.updateContent();
-                    safeThis->statusLabel.setText ("Found: " + juce::String (safeThis->getNumRows()) + " sounds", juce::dontSendNotification);
+                juce::MessageManager::callAsync ([safeThis, newResults]() {
+                    if (safeThis != nullptr)
+                        safeThis->applySearchResults (newResults);
                 });
                 return;
             }
         }
 
         juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
-        juce::MessageManager::callAsync ([safeThis] {
+        juce::MessageManager::callAsync ([safeThis]() {
             if (safeThis != nullptr)
-                safeThis->statusLabel.setText ("Error: Check API Key or Connection", juce::dontSendNotification);
+                safeThis->applyStatusMessage ("Error: Check API Key or Connection");
         });
     }
 
@@ -949,25 +971,8 @@ private:
             }
 
             juce::MessageManager::callAsync ([safeThis, index, local]() {
-                if (safeThis == nullptr)
-                    return;
-
-                if (local.existsAsFile())
-                {
-                    {
-                        const juce::ScopedLock sl (safeThis->resultsLock);
-                        if (index >= 0 && index < static_cast<int> (safeThis->results.size()))
-                            safeThis->results[static_cast<size_t> (index)].localFile = local;
-                    }
-                    safeThis->table.repaintRow (index);
-                    safeThis->proc.loadAndPlayFile (local, true);
-                    safeThis->refreshWaveformFromProcessor();
-                    safeThis->statusLabel.setText ("Ready! Drag waveform to track.", juce::dontSendNotification);
-                }
-                else
-                {
-                    safeThis->statusLabel.setText ("Download failed.", juce::dontSendNotification);
-                }
+                if (safeThis != nullptr)
+                    safeThis->finishDownloadForIndex (index, local);
             });
         });
     }
