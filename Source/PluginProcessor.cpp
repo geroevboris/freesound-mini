@@ -26,15 +26,15 @@ void FreesoundMiniAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
     transportSource.getNextAudioBlock (channelInfo);
 }
 
-void FreesoundMiniAudioProcessor::playPreview(const juce::File& file)
+void FreesoundMiniAudioProcessor::playPreview (const juce::File& file)
 {
     transportSource.stop();
     readerSource.reset();
 
-    if (auto* reader = formatManager.createReaderFor(file))
+    if (auto* reader = formatManager.createReaderFor (file))
     {
-        readerSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
-        transportSource.setSource(readerSource.get(), 0, nullptr, reader->sampleRate);
+        readerSource = std::make_unique<juce::AudioFormatReaderSource> (reader, true);
+        transportSource.setSource (readerSource.get(), 0, nullptr, reader->sampleRate);
         transportSource.start();
     }
 }
