@@ -24,6 +24,7 @@ struct SoundResult
     int sampleRate = 0;
     int bitDepth = 0;
     int channels = 0;
+    int filesize = 0;
     juce::String license;
     juce::StringArray tags;
 
@@ -59,19 +60,35 @@ class MemoryBufferAudioSource : public juce::PositionableAudioSource
 public:
     MemoryBufferAudioSource() = default;
 
-    void setBuffer (const juce::AudioBuffer<float>& newBuf)
+    void clearBuffer()
+    {
+        const juce::ScopedLock sl (lock);
+        buffer.setSize (0, 0);
+        nextPlayPos.store (0);
+        isPartial.store (false);
+    }
+
+    bool hasData() const
+    {
+        const juce::ScopedLock sl (lock);
+        return buffer.getNumSamples() > 0;
+    }
+
+    void setBuffer (const juce::AudioBuffer<float>& newBuf, bool partialFlag)
     {
         const juce::ScopedLock sl (lock);
         buffer.makeCopyOf (newBuf);
+        isPartial.store (partialFlag);
         nextPlayPos.store (0);
     }
 
-    // Бесшовная подмена стартового 48 КБ фрагмента на полный декодированный файл без прерывания звука
-    void updateBufferSeamless (const juce::AudioBuffer<float>& newBuf)
+    // Бесшовное расширение буфера на лету без сброса позиции воспроизведения
+    void updateBufferSeamless (const juce::AudioBuffer<float>& newBuf, bool partialFlag)
     {
         const juce::ScopedLock sl (lock);
         int64_t curPos = nextPlayPos.load();
         buffer.makeCopyOf (newBuf);
+        isPartial.store (partialFlag);
         int64_t newTotal = buffer.getNumSamples();
         nextPlayPos.store (juce::jlimit ((int64_t) 0, std::max ((int64_t) 0, newTotal), curPos));
     }
@@ -108,12 +125,22 @@ public:
         int64_t pos = nextPlayPos.load();
         bool rev = reversed.load();
         bool loop = looping.load();
+        bool partial = isPartial.load();
 
         for (int i = 0; i < info.numSamples; ++i)
         {
             if (pos >= total)
             {
-                if (loop)
+                if (partial)
+                {
+                    // Если длинный файл ещё докачивается в фоне — ждём следующую порцию данных,
+                    // НЕ сбрасывая позицию в 0 и НЕ завершая поток (EOF)!
+                    for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
+                        info.buffer->clear (ch, info.startSample + i, info.numSamples - i);
+                    pos = std::max ((int64_t) 0, total - 1);
+                    break;
+                }
+                else if (loop)
                 {
                     pos = 0;
                 }
@@ -161,6 +188,7 @@ private:
     std::atomic<int64_t> nextPlayPos { 0 };
     std::atomic<bool> reversed { false };
     std::atomic<bool> looping { false };
+    std::atomic<bool> isPartial { false };
 };
 
 //==============================================================================
@@ -277,7 +305,6 @@ public:
     bool hasValidOAuth() const  { return oauthAccessToken.trim().length() > 5; }
     bool isReadyToUse() const   { return hasValidOAuth() || hasValidApiKey(); }
 
-    // Фоновое декодирование MP3/аудио без блокировки главного потока окна (UI Thread)
     bool decodeMemoryBlockOffThread (const juce::MemoryBlock& mb,
                                      const SoundResult& meta,
                                      bool computeMusicalBadge,
@@ -349,13 +376,39 @@ public:
         return false;
     }
 
-    void updateDesiredPrefetchWindow (int activeId, const std::set<int>& windowIds)
+    // Вызывается ТОЛЬКО при явном выборе строки пользователем: мгновенно глушит старый звук и фиксирует новый ID
+    void prepareForNewSelection (int newActiveId)
     {
-        activePreviewSoundId.store (activeId);
+        activePreviewSoundId.store (newActiveId);
+        transportSource.stop();
+        transportSource.setSource (nullptr);
+        if (memorySource != nullptr)
+            memorySource->clearBuffer();
+
+        currentSampleMeta = SoundResult();
+        {
+            const juce::ScopedLock sl (bufferLock);
+            cachedBuffer.setSize (0, 0);
+        }
+
+        const juce::ScopedLock sl (inFlightLock);
+        if (newActiveId > 0)
+            desiredWindowSoundIds.insert (newActiveId);
+    }
+
+    bool hasActiveBufferLoaded() const
+    {
+        return memorySource != nullptr && memorySource->hasData();
+    }
+
+    // Обновляет окно фоновой предзагрузки, НЕ меняя activePreviewSoundId!
+    void updateDesiredPrefetchWindow (const std::set<int>& windowIds)
+    {
         const juce::ScopedLock sl (inFlightLock);
         desiredWindowSoundIds = windowIds;
-        if (activeId > 0)
-            desiredWindowSoundIds.insert (activeId);
+        int curActive = activePreviewSoundId.load();
+        if (curActive > 0)
+            desiredWindowSoundIds.insert (curActive);
     }
 
     bool isSoundStillDesired (int soundId) const
@@ -910,7 +963,6 @@ public:
             loadGlobalSettings();
     }
 
-    // Мгновенный запуск уже декодированного в фоновом потоке буфера (0 мс задержки на UI-потоке)
     void loadAndPlayDecoded (const DecodedPreviewData& data, const SoundResult& meta, bool resetPitchToZero)
     {
         if (data.buffer.getNumSamples() <= 0)
@@ -929,7 +981,7 @@ public:
         loadedFilePeak = (data.peak > 0.0001f) ? data.peak : 1.0f;
         originalFileSampleRate = (data.sampleRate > 0.0) ? data.sampleRate : 44100.0;
 
-        memorySource->setBuffer (data.buffer);
+        memorySource->setBuffer (data.buffer, data.isPartial);
         memorySource->setReversed (playbackMode == ModeReverse);
         memorySource->setLoopingMode (playbackMode == ModeLoop);
 
@@ -941,28 +993,29 @@ public:
         rebuildTransport (0.0, true);
     }
 
-    // Бесшовная докачка полного буфера поверх уже играющего стартового 48 КБ фрагмента
-    void upgradePlayingBufferSeamless (const DecodedPreviewData& fullData, const SoundResult& meta)
+    void upgradePlayingBufferSeamless (const DecodedPreviewData& newData, const SoundResult& meta)
     {
-        if (fullData.buffer.getNumSamples() <= 0 || currentSampleMeta.id != meta.id)
+        if (newData.buffer.getNumSamples() <= 0 || currentSampleMeta.id != meta.id)
             return;
 
-        bool wasPlaying = transportSource.isPlaying();
         currentSampleMeta = meta;
-        if (fullData.badge.isNotEmpty())
-            currentSampleMeta.detectedBpmKey = fullData.badge;
+        if (newData.badge.isNotEmpty())
+            currentSampleMeta.detectedBpmKey = newData.badge;
 
-        loadedFilePeak = (fullData.peak > 0.0001f) ? fullData.peak : 1.0f;
-        updateGainInternal();
+        if (!newData.isPartial)
+        {
+            loadedFilePeak = (newData.peak > 0.0001f) ? newData.peak : 1.0f;
+            updateGainInternal();
+        }
 
-        memorySource->updateBufferSeamless (fullData.buffer);
+        memorySource->updateBufferSeamless (newData.buffer, newData.isPartial);
 
         {
             const juce::ScopedLock sl (bufferLock);
-            cachedBuffer.makeCopyOf (fullData.buffer);
+            cachedBuffer.makeCopyOf (newData.buffer);
         }
 
-        if (wasPlaying && !transportSource.isPlaying())
+        if (!transportSource.isPlaying())
             transportSource.start();
     }
 
@@ -2466,9 +2519,9 @@ public:
             g.setColour (juce::Colours::lightgrey);
             g.setFont (12.0f);
             juce::String guideText =
-                "1. Progressive Instant Play (48 KB Start + 6x Lookahead):\n"
-                "   Playback starts as soon as the first 48 KB arrive, seamlessly appending\n"
-                "   the rest while pre-decoding 6 rows ahead in background threads.\n\n"
+                "1. Multi-Stage Progressive Streaming + 6x Lookahead:\n"
+                "   Playback starts at 64 KB and seamlessly extends the buffer (256 KB -> 768 KB -> Full)\n"
+                "   without ever restarting or triggering ghost sounds.\n\n"
                 "2. Master File Saving & Multi-Drag:\n"
                 "   Click 'Get', Heart, or drag rows/waveform directly into Ableton Live to pull\n"
                 "   the author's original uncompressed studio file. Hold Shift/Cmd for multi-drag.\n\n"
@@ -2864,7 +2917,7 @@ public:
 
     ~FreesoundMiniEditor() override
     {
-        proc.updateDesiredPrefetchWindow (0, {});
+        proc.updateDesiredPrefetchWindow ({});
         prefetchPool.removeAllJobs (true, 3000);
         stopTimer();
         signalThreadShouldExit();
@@ -3227,12 +3280,15 @@ public:
             return;
         }
 
-        if (table.getNumSelectedRows() <= 1)
+        // Если кликнули по УЖЕ выбранной строке, которая доиграла до конца и остановилась — перезапускаем её с 0.0,
+        // но НЕ запускаем дублирующий поток во время загрузки!
+        if (table.getNumSelectedRows() <= 1 && rowNumber == lastTriggeredRow)
         {
-            lastTriggeredRow = rowNumber;
-            proc.persistedSelectedRow = rowNumber;
-            pitchSlider.setValue (0.0, juce::dontSendNotification);
-            triggerPreviewInRamOrPlay (rowNumber);
+            if (!proc.isAudioPlaying() && !proc.isSoundInFlight (item.id) && proc.hasActiveBufferLoaded())
+            {
+                proc.playOrResume();
+                playPauseButton.setActiveState (proc.isAudioPlaying());
+            }
         }
     }
 
@@ -3262,7 +3318,7 @@ public:
         statusLabel.setText ("Loaded: " + juce::String (getNumRows()) + (hasMorePages ? "+ sounds (scroll for more)" : " sounds"),
                              juce::dontSendNotification);
 
-        // Агрессивно прогреваем первые 8 сэмплов сразу после выдачи результатов
+        // Тихо прогреваем первые строки в RAM без изменения activePreviewSoundId (звук сам не включится!)
         if (!append && getNumRows() > 0)
             scheduleLookaheadAroundRow (0);
     }
@@ -3273,36 +3329,44 @@ public:
         statusLabel.setText (text, juce::dontSendNotification);
     }
 
-    // Вызывается, когда прилетели первые 48 КБ активного сэмпла (~2.5 сек звука) — мгновенный старт!
-    void applyInstantPartialPreview (int soundId, const DecodedPreviewData& partialData)
+    // Принимает прогрессивные чанки (64 КБ -> 256 КБ -> 768 КБ): первый запускает звук, следующие бесшовно продлевают буфер
+    void applyProgressivePreviewChunk (int soundId, const DecodedPreviewData& chunkData)
     {
         if (proc.activePreviewSoundId.load() != soundId)
+            return;
+
+        int selRow = table.getSelectedRow();
+        int matchedRow = findRowBySoundId (soundId);
+        if (selRow < 0 || matchedRow != selRow)
             return;
 
         SoundResult matchedMeta;
         {
             const juce::ScopedLock sl (resultsLock);
-            for (const auto& r : results)
-            {
-                if (r.id == soundId)
-                {
-                    matchedMeta = r;
-                    break;
-                }
-            }
+            if (matchedRow >= 0 && matchedRow < static_cast<int> (results.size()))
+                matchedMeta = results[static_cast<size_t> (matchedRow)];
         }
 
-        if (matchedMeta.id > 0)
+        if (matchedMeta.id == 0)
+            return;
+
+        if (proc.getCurrentSampleMeta().id == soundId && proc.hasActiveBufferLoaded())
         {
-            proc.loadAndPlayDecoded (partialData, matchedMeta, true);
+            proc.upgradePlayingBufferSeamless (chunkData, matchedMeta);
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
-            statusLabel.setText ("Instant Stream Playing... (buffering tail)", juce::dontSendNotification);
+        }
+        else
+        {
+            proc.loadAndPlayDecoded (chunkData, matchedMeta, true);
+            refreshWaveformFromProcessor();
+            playPauseButton.setActiveState (proc.isAudioPlaying());
+            statusLabel.setText ("Instant Stream Playing... (buffering full audio)", juce::dontSendNotification);
         }
     }
 
-    // Вызывается, когда сэмпл докачался и декодировался целиком (бесшовный апгрейд или старт с нуля)
-    void applyCompletedPreview (int soundId, const DecodedPreviewData& fullData, bool hadPartialStart)
+    // Вызывается, когда сэмпл докачался и декодировался на 100%
+    void applyCompletedPreview (int soundId, const DecodedPreviewData& fullData)
     {
         SoundResult matchedMeta;
         int matchedRow = -1;
@@ -3322,10 +3386,12 @@ public:
             }
         }
 
-        if (proc.activePreviewSoundId.load() != soundId || matchedMeta.id == 0)
+        // Строгая проверка: звук запускается/обновляется ТОЛЬКО если он сейчас выделен пользователем!
+        int selRow = table.getSelectedRow();
+        if (proc.activePreviewSoundId.load() != soundId || matchedMeta.id == 0 || selRow < 0 || matchedRow != selRow)
             return;
 
-        if (hadPartialStart && proc.getCurrentSampleMeta().id == soundId)
+        if (proc.getCurrentSampleMeta().id == soundId && proc.hasActiveBufferLoaded())
             proc.upgradePlayingBufferSeamless (fullData, matchedMeta);
         else
             proc.loadAndPlayDecoded (fullData, matchedMeta, true);
@@ -3494,6 +3560,7 @@ private:
         favFilterButton.setActiveState (false);
         hasPinnedReference = false;
         similarSoundIdSnapshot = 0;
+        lastTriggeredRow = -1;
 
         searchInput.setText (entry.query, false);
         durRangeSlider.setMinAndMaxValues (entry.minSlider, entry.maxSlider, juce::dontSendNotification);
@@ -3710,7 +3777,7 @@ private:
         isLoadingMore = true;
         hasMorePages = true;
 
-        proc.updateDesiredPrefetchWindow (0, {});
+        proc.updateDesiredPrefetchWindow ({});
         prefetchPool.removeAllJobs (false, 200);
 
         {
@@ -3748,7 +3815,7 @@ private:
         isLoadingMore = true;
         hasMorePages = false;
 
-        proc.updateDesiredPrefetchWindow (refSound.id, {});
+        proc.updateDesiredPrefetchWindow ({ refSound.id });
         prefetchPool.removeAllJobs (false, 200);
 
         {
@@ -3768,6 +3835,7 @@ private:
             showingFavoritesOnly = !showingFavoritesOnly;
 
         favFilterButton.setActiveState (showingFavoritesOnly);
+        lastTriggeredRow = -1;
 
         if (showingFavoritesOnly)
         {
@@ -3883,7 +3951,7 @@ private:
         isLoadingMore = true;
         hasMorePages = false;
 
-        proc.updateDesiredPrefetchWindow (0, {});
+        proc.updateDesiredPrefetchWindow ({});
         prefetchPool.removeAllJobs (false, 200);
 
         {
@@ -3975,7 +4043,7 @@ private:
         waveformDisplay.setWaveformData (temp, meta.name, meta.detectedBpmKey, isFav, (int) proc.getPlaybackMode());
     }
 
-    // Мгновенный запуск из декодированного RAM-кэша или подключение к неразрушающему конвейеру
+    // Единственная точка входа для запуска выбранного пользователем звука
     void triggerPreviewInRamOrPlay (int index)
     {
         SoundResult item;
@@ -3986,12 +4054,17 @@ private:
             item = results[static_cast<size_t> (index)];
         }
 
-        // Обновляем окно желаемых сэмплов [index - 1 ... index + 6], НЕ убивая загрузку самого item.id!
+        // 1. Немедленно останавливаем старый звук и фиксируем ID нового выбранного сэмпла
+        proc.prepareForNewSelection (item.id);
+        playPauseButton.setActiveState (false);
+        refreshWaveformFromProcessor();
+
+        // 2. Обновляем скользящее окно предзагрузки [index - 1 ... index + 6]
         scheduleLookaheadAroundRow (index);
 
-        // 1. Проверяем готовый декодированный буфер в RAM (0 мс старт!)
+        // 3. Проверяем готовый декодированный буфер в RAM (0 мс старт!)
         DecodedPreviewData readyDecoded;
-        if (proc.getDecodedPreview (item.id, readyDecoded))
+        if (proc.getDecodedPreview (item.id, readyDecoded) && !readyDecoded.isPartial)
         {
             if (readyDecoded.badge.isNotEmpty())
             {
@@ -4009,7 +4082,7 @@ private:
             return;
         }
 
-        // 2. Если файл уже есть на диске — читаем с диска
+        // 4. Если мастер-файл уже есть на диске — читаем с диска
         if (item.localFile.existsAsFile())
         {
             juce::String badge = proc.loadAndPlayFile (item.localFile, item, true);
@@ -4025,7 +4098,7 @@ private:
             return;
         }
 
-        // 3. Если сжатый MP3 уже в кэше — декодируем его в фоне за несколько миллисекунд
+        // 5. Если сжатый MP3 уже в кэше — декодируем в фоне
         juce::MemoryBlock cachedMb;
         if (proc.getRamCachedMp3 (item.id, cachedMb))
         {
@@ -4039,33 +4112,29 @@ private:
                     pPtr->storeDecodedPreview (item.id, d);
                     juce::MessageManager::callAsync ([safeThis, id = item.id, d]() {
                         if (safeThis != nullptr)
-                            safeThis->applyCompletedPreview (id, d, false);
+                            safeThis->applyCompletedPreview (id, d);
                     });
                 }
             });
             return;
         }
 
-        // 4. Если этот звук ещё не в полёте — запускаем приоритетный поток с 48 КБ мгновенным стартом
-        statusLabel.setText ("Buffering first 48 KB...", juce::dontSendNotification);
-        launchProgressiveStreamForSound (item, true);
+        // 6. Запускаем потоковую подгрузку (если уже качается в пуле предзагрузки — поток сам подхватит активный ID!)
+        statusLabel.setText ("Buffering stream...", juce::dontSendNotification);
+        launchProgressiveStreamForSound (item);
     }
 
-    // Формирует скользящее окно [centerRow - 1 ... centerRow + 6] и ставит сэмплы в многопоточный прогрев
+    // Формирует скользящее окно [centerRow - 1 ... centerRow + 6], НЕ меняя activePreviewSoundId
     void scheduleLookaheadAroundRow (int centerRow)
     {
         std::vector<SoundResult> toPrefetch;
         std::set<int> windowIds;
-        int activeId = 0;
 
         {
             const juce::ScopedLock sl (resultsLock);
             int total = static_cast<int> (results.size());
             if (total == 0)
                 return;
-
-            if (centerRow >= 0 && centerRow < total)
-                activeId = results[static_cast<size_t> (centerRow)].id;
 
             int startR = std::max (0, centerRow - 1);
             int endR   = std::min (total - 1, centerRow + 6);
@@ -4082,13 +4151,13 @@ private:
             }
         }
 
-        proc.updateDesiredPrefetchWindow (activeId, windowIds);
+        proc.updateDesiredPrefetchWindow (windowIds);
 
         for (const auto& item : toPrefetch)
         {
             DecodedPreviewData dummyDec;
             if (item.localFile.existsAsFile()
-                || proc.getDecodedPreview (item.id, dummyDec)
+                || (proc.getDecodedPreview (item.id, dummyDec) && !dummyDec.isPartial)
                 || proc.isSoundInFlight (item.id))
                 continue;
 
@@ -4100,27 +4169,22 @@ private:
         }
     }
 
-    void launchProgressiveStreamForSound (const SoundResult& item, bool isHighPriorityActive)
+    void launchProgressiveStreamForSound (const SoundResult& item)
     {
         if (item.id <= 0 || item.previewUrl.isEmpty())
             return;
 
-        // Если фоновый поток предзагрузки УЖЕ качает этот файл — ничего не сбрасываем!
-        // Он сам увидит, что activePreviewSoundId == item.id, и мгновенно включит звук!
         if (proc.isSoundInFlight (item.id))
             return;
 
-        if (isHighPriorityActive)
-        {
-            juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
-            juce::Thread::launch ([safeThis, item]() {
-                if (safeThis != nullptr)
-                    safeThis->runStreamAndDecodeTask (item);
-            });
-        }
+        juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
+        juce::Thread::launch ([safeThis, item]() {
+            if (safeThis != nullptr)
+                safeThis->runStreamAndDecodeTask (item);
+        });
     }
 
-    // Единый конвейер: качает чанками по 8 КБ, на 48 КБ запускает звук, по завершении декодирует целиком и считает BPM/Key
+    // Многоступенчатый потоковый конвейер: 64 КБ (старт) -> 256 КБ (продление) -> 768 КБ (продление) -> 100% (финал)
     void runStreamAndDecodeTask (SoundResult item)
     {
         if (!proc.isSoundStillDesired (item.id))
@@ -4129,8 +4193,16 @@ private:
         if (!proc.tryMarkSoundInFlight (item.id))
             return;
 
+        // Проверяем, не успел ли другой поток уже полностью декодировать этот сэмпл
+        DecodedPreviewData existingDec;
+        if (proc.getDecodedPreview (item.id, existingDec) && !existingDec.isPartial)
+        {
+            proc.unmarkSoundInFlight (item.id);
+            return;
+        }
+
         juce::MemoryBlock mb;
-        bool partialTriggered = false;
+        size_t nextPartialThreshold = 65536; // Первый старт на 64 КБ (~2.8 сек звука)
 
         juce::URL url (item.previewUrl);
         auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
@@ -4144,7 +4216,7 @@ private:
                 if (!proc.isSoundStillDesired (item.id))
                 {
                     proc.unmarkSoundInFlight (item.id);
-                    return; // Сбрасываем только те загрузки, которые ушли далеко за пределы окна!
+                    return;
                 }
 
                 int bytesRead = stream->read (buffer, sizeof (buffer));
@@ -4153,22 +4225,23 @@ private:
 
                 mb.append (buffer, (size_t) bytesRead);
 
-                // Как только накопили первые 48 КБ (~2.5-3 сек звука) для активной строки — декодируем и включаем звук!
-                if (!partialTriggered
-                    && proc.activePreviewSoundId.load() == item.id
-                    && mb.getSize() >= 49152)
+                // Если этот сэмпл сейчас ждёт пользователь — подаём прогрессивные чанки (64 КБ -> 256 КБ -> 768 КБ),
+                // чтобы даже 2-минутные файлы играли непрерывно без опустошения буфера!
+                if (proc.activePreviewSoundId.load() == item.id && mb.getSize() >= nextPartialThreshold)
                 {
-                    DecodedPreviewData partialData;
-                    if (proc.decodeMemoryBlockOffThread (mb, item, false, partialData))
-                    {
-                        partialData.isPartial = true;
-                        partialTriggered = true;
+                    if (nextPartialThreshold == 65536)       nextPartialThreshold = 262144;
+                    else if (nextPartialThreshold == 262144) nextPartialThreshold = 786432;
+                    else                                     nextPartialThreshold = 100000000;
 
+                    DecodedPreviewData chunkData;
+                    if (proc.decodeMemoryBlockOffThread (mb, item, false, chunkData))
+                    {
+                        chunkData.isPartial = true;
                         juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
                         int sid = item.id;
-                        juce::MessageManager::callAsync ([safeThis, sid, partialData]() {
+                        juce::MessageManager::callAsync ([safeThis, sid, chunkData]() {
                             if (safeThis != nullptr)
-                                safeThis->applyInstantPartialPreview (sid, partialData);
+                                safeThis->applyProgressivePreviewChunk (sid, chunkData);
                         });
                     }
                 }
@@ -4177,21 +4250,21 @@ private:
 
         if (mb.getSize() > 0 && proc.isSoundStillDesired (item.id))
         {
-            proc.storeRamCachedMp3 (item.id, mb);
-
             DecodedPreviewData fullData;
             if (proc.decodeMemoryBlockOffThread (mb, item, true, fullData))
             {
                 fullData.isPartial = false;
+                // Сначала сохраняем декодированный буфер, и только потом MP3 в кэш
                 proc.storeDecodedPreview (item.id, fullData);
+                proc.storeRamCachedMp3 (item.id, mb);
 
                 if (proc.activePreviewSoundId.load() == item.id)
                 {
                     juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
                     int sid = item.id;
-                    juce::MessageManager::callAsync ([safeThis, sid, fullData, partialTriggered]() {
+                    juce::MessageManager::callAsync ([safeThis, sid, fullData]() {
                         if (safeThis != nullptr)
-                            safeThis->applyCompletedPreview (sid, fullData, partialTriggered);
+                            safeThis->applyCompletedPreview (sid, fullData);
                     });
                 }
             }
