@@ -82,7 +82,6 @@ public:
         nextPlayPos.store (0);
     }
 
-    // Бесшовное расширение буфера на лету без сброса позиции воспроизведения
     void updateBufferSeamless (const juce::AudioBuffer<float>& newBuf, bool partialFlag)
     {
         const juce::ScopedLock sl (lock);
@@ -133,8 +132,6 @@ public:
             {
                 if (partial)
                 {
-                    // Если длинный файл ещё докачивается в фоне — ждём следующую порцию данных,
-                    // НЕ сбрасывая позицию в 0 и НЕ завершая поток (EOF)!
                     for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
                         info.buffer->clear (ch, info.startSample + i, info.numSamples - i);
                     pos = std::max ((int64_t) 0, total - 1);
@@ -377,7 +374,6 @@ public:
         return false;
     }
 
-    // Вызывается ТОЛЬКО при явном выборе строки пользователем: мгновенно глушит старый звук и фиксирует новый ID
     void prepareForNewSelection (int newActiveId)
     {
         activePreviewSoundId.store (newActiveId);
@@ -402,7 +398,6 @@ public:
         return memorySource != nullptr && memorySource->hasData();
     }
 
-    // Обновляет окно фоновой предзагрузки, НЕ меняя activePreviewSoundId!
     void updateDesiredPrefetchWindow (const std::set<int>& windowIds)
     {
         const juce::ScopedLock sl (inFlightLock);
@@ -849,15 +844,14 @@ public:
 
     void releaseResources() override { transportSource.releaseResources(); }
 
+    // Audio Passthrough: пропускает звук Ableton и мягко подмешивает аудио плагина
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
     {
         juce::ScopedNoDenormals noDenormals;
 
-        // Если плагин ничего не играет — просто пропускаем звук из Ableton дальше без изменений
         if (!transportSource.isPlaying())
             return;
 
-        // Если сэмпл воспроизводится — рендерим его во временный буфер и мягко подмешиваем к дорожке
         juce::AudioBuffer<float> previewBuf (buffer.getNumChannels(), buffer.getNumSamples());
         previewBuf.clear();
         juce::AudioSourceChannelInfo channelInfo (&previewBuf, 0, buffer.getNumSamples());
@@ -1186,6 +1180,7 @@ public:
     void setGain (float g) { previewGain = g; updateGainInternal(); }
     float getGain() const { return previewGain; }
 
+    // Плавное изменение питча на лету без щелчков и остановок
     void setPitchSemitones (double semitones)
     {
         if (std::abs (pitchSemitones - semitones) < 0.001)
@@ -1194,8 +1189,8 @@ public:
         pitchSemitones = semitones;
         if (memorySource != nullptr && memorySource->getTotalLength() > 0)
         {
-            double pos = transportSource.getCurrentPosition();
-            rebuildTransport (pos, false);
+            double speedRatio = std::pow (2.0, pitchSemitones / 12.0);
+            transportSource.setSource (memorySource.get(), 0, nullptr, originalFileSampleRate * speedRatio);
         }
     }
 
@@ -1656,7 +1651,7 @@ private:
 class IconButton : public juce::Button
 {
 public:
-    enum Type { PlayPause, Stop, Dice2D, HashTag, Heart, BackArrow, ModeCycle, Info, Close };
+    enum Type { PlayPause, Stop, Dice2D, HashTag, Heart, BackArrow, ModeCycle, Info, Close, Lock };
 
     explicit IconButton (Type t, bool noBorder = false)
         : juce::Button (""), iconType (t), frameless (noBorder) {}
@@ -1833,6 +1828,32 @@ public:
                 p.lineTo (cx - s * 0.7f, cy + s * 0.7f);
                 g.strokePath (p, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
                 break;
+
+            case Lock:
+            {
+                float bodyW = s * 1.5f;
+                float bodyH = s * 1.15f;
+                float bodyY = cy - bodyH * 0.15f;
+                g.drawRoundedRectangle (cx - bodyW * 0.5f, bodyY, bodyW, bodyH, 2.0f, 1.4f);
+
+                float shackleR = bodyW * 0.32f;
+                juce::Path shackle;
+                if (isActiveState)
+                {
+                    shackle.addCentredArc (cx, bodyY - 1.0f, shackleR, shackleR, 0.0f, -juce::MathConstants<float>::pi * 0.5f, juce::MathConstants<float>::pi * 0.5f, true);
+                    shackle.lineTo (cx + shackleR, bodyY + 1.0f);
+                    shackle.startNewSubPath (cx - shackleR, bodyY - 1.0f);
+                    shackle.lineTo (cx - shackleR, bodyY + 1.0f);
+                }
+                else
+                {
+                    shackle.addCentredArc (cx, bodyY - 2.0f, shackleR, shackleR, 0.0f, -juce::MathConstants<float>::pi * 0.6f, juce::MathConstants<float>::pi * 0.4f, true);
+                    shackle.lineTo (cx - shackleR, bodyY + 1.0f);
+                }
+                g.strokePath (shackle, juce::PathStrokeType (1.4f));
+                g.fillEllipse (cx - 1.2f, bodyY + bodyH * 0.35f, 2.4f, 2.4f);
+                break;
+            }
 
             case Heart:
                 break;
@@ -2536,9 +2557,9 @@ public:
                 "2. Master File Saving & Multi-Drag:\n"
                 "   Click 'Get', Heart, or drag rows/waveform directly into Ableton Live to pull\n"
                 "   the author's original uncompressed studio file. Hold Shift/Cmd for multi-drag.\n\n"
-                "3. Transport & Waveform:\n"
-                "   Space: Play/Pause | 2x Space: Stop | Top-left waveform icon: Normal / Reverse / Loop.\n"
-                "   Right-click any row for 'Show Similar Sounds' (pins [REF] at top).";
+                "3. Transport, Waveform & Pitch Lock:\n"
+                "   Space: Play/Pause | 2x Space: Stop | Waveform icon: Normal / Reverse / Loop.\n"
+                "   Click the lock icon (Lock) next to pitch to preserve transpose across samples.";
 
             g.drawFittedText (guideText, x, 160, w, 245, juce::Justification::topLeft, 18);
 
@@ -2862,6 +2883,13 @@ public:
         pitchSlider.onValueChange = [this] { proc.setPitchSemitones (pitchSlider.getValue()); };
         addAndMakeVisible (pitchSlider);
 
+        pitchLockBtn.onClick = [this] {
+            isPitchLocked = !isPitchLocked;
+            pitchLockBtn.setActiveState (isPitchLocked);
+            statusLabel.setText (isPitchLocked ? "Pitch Locked (preserved across sounds)" : "Pitch Unlocked", juce::dontSendNotification);
+        };
+        addAndMakeVisible (pitchLockBtn);
+
         normCheckbox.setButtonText ("Norm -6dB");
         normCheckbox.setToggleState (proc.getNormalization(), juce::dontSendNotification);
         normCheckbox.onClick = [this] { proc.setNormalization (normCheckbox.getToggleState()); };
@@ -3040,6 +3068,7 @@ public:
 
         bArea.removeFromLeft (8);
         pitchSlider.setBounds (bArea.removeFromLeft (54));
+        pitchLockBtn.setBounds (pitchSlider.getRight() - 15, pitchSlider.getY() + 2, 14, 14);
 
         bArea.removeFromLeft (6);
         normCheckbox.setBounds (bArea.removeFromLeft (80));
@@ -3230,7 +3259,8 @@ public:
         {
             lastTriggeredRow = lastRowSelected;
             proc.persistedSelectedRow = lastRowSelected;
-            pitchSlider.setValue (0.0, juce::dontSendNotification);
+            if (!isPitchLocked)
+                pitchSlider.setValue (0.0, juce::dontSendNotification);
             triggerPreviewInRamOrPlay (lastRowSelected);
         }
     }
@@ -3291,8 +3321,6 @@ public:
             return;
         }
 
-        // Если кликнули по УЖЕ выбранной строке, которая доиграла до конца и остановилась — перезапускаем её с 0.0,
-        // но НЕ запускаем дублирующий поток во время загрузки!
         if (table.getNumSelectedRows() <= 1 && rowNumber == lastTriggeredRow)
         {
             if (!proc.isAudioPlaying() && !proc.isSoundInFlight (item.id) && proc.hasActiveBufferLoaded())
@@ -3329,7 +3357,6 @@ public:
         statusLabel.setText ("Loaded: " + juce::String (getNumRows()) + (hasMorePages ? "+ sounds (scroll for more)" : " sounds"),
                              juce::dontSendNotification);
 
-        // Тихо прогреваем первые строки в RAM без изменения activePreviewSoundId (звук сам не включится!)
         if (!append && getNumRows() > 0)
             scheduleLookaheadAroundRow (0);
     }
@@ -3340,7 +3367,6 @@ public:
         statusLabel.setText (text, juce::dontSendNotification);
     }
 
-    // Принимает прогрессивные чанки (64 КБ -> 256 КБ -> 768 КБ): первый запускает звук, следующие бесшовно продлевают буфер
     void applyProgressivePreviewChunk (int soundId, const DecodedPreviewData& chunkData)
     {
         if (proc.activePreviewSoundId.load() != soundId)
@@ -3361,6 +3387,8 @@ public:
         if (matchedMeta.id == 0)
             return;
 
+        bool resetPitch = !isPitchLocked;
+
         if (proc.getCurrentSampleMeta().id == soundId && proc.hasActiveBufferLoaded())
         {
             proc.upgradePlayingBufferSeamless (chunkData, matchedMeta);
@@ -3369,14 +3397,13 @@ public:
         }
         else
         {
-            proc.loadAndPlayDecoded (chunkData, matchedMeta, true);
+            proc.loadAndPlayDecoded (chunkData, matchedMeta, resetPitch);
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
             statusLabel.setText ("Instant Stream Playing... (buffering full audio)", juce::dontSendNotification);
         }
     }
 
-    // Вызывается, когда сэмпл докачался и декодировался на 100%
     void applyCompletedPreview (int soundId, const DecodedPreviewData& fullData)
     {
         SoundResult matchedMeta;
@@ -3397,15 +3424,16 @@ public:
             }
         }
 
-        // Строгая проверка: звук запускается/обновляется ТОЛЬКО если он сейчас выделен пользователем!
         int selRow = table.getSelectedRow();
         if (proc.activePreviewSoundId.load() != soundId || matchedMeta.id == 0 || selRow < 0 || matchedRow != selRow)
             return;
 
+        bool resetPitch = !isPitchLocked;
+
         if (proc.getCurrentSampleMeta().id == soundId && proc.hasActiveBufferLoaded())
             proc.upgradePlayingBufferSeamless (fullData, matchedMeta);
         else
-            proc.loadAndPlayDecoded (fullData, matchedMeta, true);
+            proc.loadAndPlayDecoded (fullData, matchedMeta, resetPitch);
 
         syncStateToProcessor();
         refreshWaveformFromProcessor();
@@ -4054,7 +4082,6 @@ private:
         waveformDisplay.setWaveformData (temp, meta.name, meta.detectedBpmKey, isFav, (int) proc.getPlaybackMode());
     }
 
-    // Единственная точка входа для запуска выбранного пользователем звука
     void triggerPreviewInRamOrPlay (int index)
     {
         SoundResult item;
@@ -4065,15 +4092,14 @@ private:
             item = results[static_cast<size_t> (index)];
         }
 
-        // 1. Немедленно останавливаем старый звук и фиксируем ID нового выбранного сэмпла
         proc.prepareForNewSelection (item.id);
         playPauseButton.setActiveState (false);
         refreshWaveformFromProcessor();
 
-        // 2. Обновляем скользящее окно предзагрузки [index - 1 ... index + 6]
         scheduleLookaheadAroundRow (index);
 
-        // 3. Проверяем готовый декодированный буфер в RAM (0 мс старт!)
+        bool resetPitch = !isPitchLocked;
+
         DecodedPreviewData readyDecoded;
         if (proc.getDecodedPreview (item.id, readyDecoded) && !readyDecoded.isPartial)
         {
@@ -4084,7 +4110,7 @@ private:
                     results[static_cast<size_t> (index)].detectedBpmKey = readyDecoded.badge;
                 item.detectedBpmKey = readyDecoded.badge;
             }
-            proc.loadAndPlayDecoded (readyDecoded, item, true);
+            proc.loadAndPlayDecoded (readyDecoded, item, resetPitch);
             syncStateToProcessor();
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
@@ -4093,10 +4119,9 @@ private:
             return;
         }
 
-        // 4. Если мастер-файл уже есть на диске — читаем с диска
         if (item.localFile.existsAsFile())
         {
-            juce::String badge = proc.loadAndPlayFile (item.localFile, item, true);
+            juce::String badge = proc.loadAndPlayFile (item.localFile, item, resetPitch);
             {
                 const juce::ScopedLock sl (resultsLock);
                 if (index >= 0 && index < static_cast<int> (results.size()))
@@ -4109,7 +4134,6 @@ private:
             return;
         }
 
-        // 5. Если сжатый MP3 уже в кэше — декодируем в фоне
         juce::MemoryBlock cachedMb;
         if (proc.getRamCachedMp3 (item.id, cachedMb))
         {
@@ -4130,12 +4154,10 @@ private:
             return;
         }
 
-        // 6. Запускаем потоковую подгрузку (если уже качается в пуле предзагрузки — поток сам подхватит активный ID!)
         statusLabel.setText ("Buffering stream...", juce::dontSendNotification);
         launchProgressiveStreamForSound (item);
     }
 
-    // Формирует скользящее окно [centerRow - 1 ... centerRow + 6], НЕ меняя activePreviewSoundId
     void scheduleLookaheadAroundRow (int centerRow)
     {
         std::vector<SoundResult> toPrefetch;
@@ -4195,7 +4217,6 @@ private:
         });
     }
 
-    // Многоступенчатый потоковый конвейер: 64 КБ (старт) -> 256 КБ (продление) -> 768 КБ (продление) -> 100% (финал)
     void runStreamAndDecodeTask (SoundResult item)
     {
         if (!proc.isSoundStillDesired (item.id))
@@ -4204,7 +4225,6 @@ private:
         if (!proc.tryMarkSoundInFlight (item.id))
             return;
 
-        // Проверяем, не успел ли другой поток уже полностью декодировать этот сэмпл
         DecodedPreviewData existingDec;
         if (proc.getDecodedPreview (item.id, existingDec) && !existingDec.isPartial)
         {
@@ -4213,7 +4233,7 @@ private:
         }
 
         juce::MemoryBlock mb;
-        size_t nextPartialThreshold = 65536; // Первый старт на 64 КБ (~2.8 сек звука)
+        size_t nextPartialThreshold = 65536;
 
         juce::URL url (item.previewUrl);
         auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
@@ -4236,8 +4256,6 @@ private:
 
                 mb.append (buffer, (size_t) bytesRead);
 
-                // Если этот сэмпл сейчас ждёт пользователь — подаём прогрессивные чанки (64 КБ -> 256 КБ -> 768 КБ),
-                // чтобы даже 2-минутные файлы играли непрерывно без опустошения буфера!
                 if (proc.activePreviewSoundId.load() == item.id && mb.getSize() >= nextPartialThreshold)
                 {
                     if (nextPartialThreshold == 65536)       nextPartialThreshold = 262144;
@@ -4265,7 +4283,6 @@ private:
             if (proc.decodeMemoryBlockOffThread (mb, item, true, fullData))
             {
                 fullData.isPartial = false;
-                // Сначала сохраняем декодированный буфер, и только потом MP3 в кэш
                 proc.storeDecodedPreview (item.id, fullData);
                 proc.storeRamCachedMp3 (item.id, mb);
 
@@ -4483,6 +4500,8 @@ private:
     IconButton stopButton        { IconButton::Stop, true };
 
     juce::Slider pitchSlider;
+    IconButton pitchLockBtn      { IconButton::Lock, true };
+    bool isPitchLocked = false;
     juce::ToggleButton normCheckbox;
     juce::Slider volSlider;
     juce::Label volLabel;
