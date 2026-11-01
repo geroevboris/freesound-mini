@@ -198,7 +198,8 @@ public:
     enum PlaybackMode { ModeNormal = 0, ModeReverse = 1, ModeLoop = 2 };
 
     FreesoundMiniAudioProcessor()
-        : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+        : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
     {
         formatManager.registerBasicFormats();
         memorySource = std::make_unique<MemoryBufferAudioSource>();
@@ -851,9 +852,19 @@ public:
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
     {
         juce::ScopedNoDenormals noDenormals;
-        buffer.clear();
-        juce::AudioSourceChannelInfo channelInfo (&buffer, 0, buffer.getNumSamples());
+
+        // Если плагин ничего не играет — просто пропускаем звук из Ableton дальше без изменений
+        if (!transportSource.isPlaying())
+            return;
+
+        // Если сэмпл воспроизводится — рендерим его во временный буфер и мягко подмешиваем к дорожке
+        juce::AudioBuffer<float> previewBuf (buffer.getNumChannels(), buffer.getNumSamples());
+        previewBuf.clear();
+        juce::AudioSourceChannelInfo channelInfo (&previewBuf, 0, buffer.getNumSamples());
         transportSource.getNextAudioBlock (channelInfo);
+
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            buffer.addFrom (ch, 0, previewBuf, ch, 0, buffer.getNumSamples());
     }
 
     juce::AudioProcessorEditor* createEditor() override;
