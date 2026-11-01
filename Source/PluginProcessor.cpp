@@ -29,6 +29,7 @@ struct SoundResult
 
     juce::String detectedBpmKey;
     bool isPinnedRef = false;
+    bool isDownloadingMaster = false;
 };
 
 struct SearchHistoryEntry
@@ -193,16 +194,274 @@ public:
         return getFavoritesDirectory().getChildFile ("favorites_index.xml");
     }
 
-    juce::File getSampleFileFor (int soundId, const juce::String& name) const
+    static juce::String cleanExtension (const juce::String& formatType)
     {
-        auto sanitized = juce::File::createLegalFileName (name);
-        return sampleDirectory.getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+        auto ext = formatType.trim().toLowerCase();
+        if (ext.startsWithChar ('.'))
+            ext = ext.substring (1);
+        if (ext == "wave")
+            ext = "wav";
+        if (ext.isEmpty())
+            ext = "wav";
+        return ext;
     }
 
-    juce::File getFavoriteFileFor (int soundId, const juce::String& name) const
+    static juce::String stripKnownAudioExtension (const juce::String& rawName)
     {
-        auto sanitized = juce::File::createLegalFileName (name);
-        return getFavoritesDirectory().getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+        auto trimmed = rawName.trim();
+        static const char* exts[] = { ".wav", ".wave", ".flac", ".aif", ".aiff", ".ogg", ".mp3", ".m4a", ".caf" };
+        auto lower = trimmed.toLowerCase();
+        for (auto* e : exts)
+        {
+            if (lower.endsWith (e))
+                return trimmed.dropLastCharacters ((int) std::strlen (e));
+        }
+        return trimmed;
+    }
+
+    juce::File getSampleFileFor (int soundId, const juce::String& name, const juce::String& formatType) const
+    {
+        auto baseName = juce::File::createLegalFileName (stripKnownAudioExtension (name));
+        auto ext = cleanExtension (formatType);
+        return sampleDirectory.getChildFile (juce::String (soundId) + "_" + baseName + "." + ext);
+    }
+
+    juce::File getFavoriteFileFor (int soundId, const juce::String& name, const juce::String& formatType) const
+    {
+        auto baseName = juce::File::createLegalFileName (stripKnownAudioExtension (name));
+        auto ext = cleanExtension (formatType);
+        return getFavoritesDirectory().getChildFile (juce::String (soundId) + "_" + baseName + "." + ext);
+    }
+
+    juce::File findExistingLocalFile (int soundId, const juce::String& name, const juce::String& formatType) const
+    {
+        auto primary = getSampleFileFor (soundId, name, formatType);
+        if (primary.existsAsFile())
+            return primary;
+
+        auto favPrimary = getFavoriteFileFor (soundId, name, formatType);
+        if (favPrimary.existsAsFile())
+            return favPrimary;
+
+        auto fallbackMp3 = getSampleFileFor (soundId, name, "mp3");
+        if (fallbackMp3.existsAsFile())
+            return fallbackMp3;
+
+        auto favMp3 = getFavoriteFileFor (soundId, name, "mp3");
+        if (favMp3.existsAsFile())
+            return favMp3;
+
+        return {};
+    }
+
+    bool hasValidApiKey() const
+    {
+        return savedToken.trim().length() > 5;
+    }
+
+    bool hasValidOAuth() const
+    {
+        return oauthAccessToken.trim().length() > 5;
+    }
+
+    bool isReadyToUse() const
+    {
+        return hasValidOAuth() || hasValidApiKey();
+    }
+
+    bool exchangeAuthCodeForTokensSync (const juce::String& cId,
+                                        const juce::String& cSecret,
+                                        const juce::String& authCode,
+                                        juce::String& outError)
+    {
+        auto cleanId = cId.trim();
+        auto cleanSecret = cSecret.trim();
+        auto cleanCode = authCode.trim();
+
+        if (cleanId.isEmpty() || cleanSecret.isEmpty() || cleanCode.isEmpty())
+        {
+            outError = "Please fill in Client ID, Secret, and Authorization Code.";
+            return false;
+        }
+
+        juce::URL url ("https://freesound.org/apiv2/oauth2/access_token/");
+        juce::String postBody = "client_id=" + juce::URL::addEscapeChars (cleanId, true)
+                              + "&client_secret=" + juce::URL::addEscapeChars (cleanSecret, true)
+                              + "&grant_type=authorization_code"
+                              + "&code=" + juce::URL::addEscapeChars (cleanCode, true);
+
+        url = url.withPOSTData (postBody);
+
+        auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inPostData)
+                           .withConnectionTimeoutMs (12000)
+                           .withExtraHeaders ("Content-Type: application/x-www-form-urlencoded\r\n");
+
+        juce::String response;
+        if (auto stream = url.createInputStream (options))
+            response = stream->readEntireStreamAsString();
+
+        auto parsed = juce::JSON::parse (response);
+        if (auto* obj = parsed.getDynamicObject())
+        {
+            auto acc = obj->getProperty ("access_token").toString().trim();
+            auto ref = obj->getProperty ("refresh_token").toString().trim();
+
+            if (acc.isNotEmpty())
+            {
+                savedClientId = cleanId;
+                savedToken = cleanSecret;
+                oauthAccessToken = acc;
+                if (ref.isNotEmpty())
+                    oauthRefreshToken = ref;
+
+                saveGlobalSettings();
+                return true;
+            }
+
+            auto errDesc = obj->getProperty ("error_description").toString();
+            if (errDesc.isEmpty())
+                errDesc = obj->getProperty ("error").toString();
+            outError = errDesc.isNotEmpty() ? errDesc : "Invalid code or credentials.";
+            return false;
+        }
+
+        outError = "Network error or invalid response from Freesound.";
+        return false;
+    }
+
+    bool refreshOAuthTokenSync()
+    {
+        const juce::ScopedLock sl (oauthLock);
+        if (savedClientId.trim().isEmpty() || savedToken.trim().isEmpty() || oauthRefreshToken.trim().isEmpty())
+            return false;
+
+        juce::URL url ("https://freesound.org/apiv2/oauth2/access_token/");
+        juce::String postBody = "client_id=" + juce::URL::addEscapeChars (savedClientId.trim(), true)
+                              + "&client_secret=" + juce::URL::addEscapeChars (savedToken.trim(), true)
+                              + "&grant_type=refresh_token"
+                              + "&refresh_token=" + juce::URL::addEscapeChars (oauthRefreshToken.trim(), true);
+
+        url = url.withPOSTData (postBody);
+
+        auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inPostData)
+                           .withConnectionTimeoutMs (12000)
+                           .withExtraHeaders ("Content-Type: application/x-www-form-urlencoded\r\n");
+
+        juce::String response;
+        if (auto stream = url.createInputStream (options))
+            response = stream->readEntireStreamAsString();
+
+        auto parsed = juce::JSON::parse (response);
+        if (auto* obj = parsed.getDynamicObject())
+        {
+            auto acc = obj->getProperty ("access_token").toString().trim();
+            auto ref = obj->getProperty ("refresh_token").toString().trim();
+            if (acc.isNotEmpty())
+            {
+                oauthAccessToken = acc;
+                if (ref.isNotEmpty())
+                    oauthRefreshToken = ref;
+                saveGlobalSettings();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool downloadStreamWithBearer (int soundId, const juce::String& bearerToken, juce::MemoryBlock& outData)
+    {
+        if (soundId <= 0 || bearerToken.isEmpty())
+            return false;
+
+        juce::URL url ("https://freesound.org/apiv2/sounds/" + juce::String (soundId) + "/download/");
+        auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                           .withConnectionTimeoutMs (20000)
+                           .withNumRedirectsToFollow (5)
+                           .withExtraHeaders ("Authorization: Bearer " + bearerToken + "\r\n");
+
+        int statusCode = 0;
+        auto optsWithStatus = options.withStatusCode (&statusCode);
+
+        if (auto stream = url.createInputStream (optsWithStatus))
+        {
+            if (statusCode >= 200 && statusCode < 300)
+            {
+                stream->readIntoMemoryBlock (outData);
+                return outData.getSize() > 256;
+            }
+        }
+        return false;
+    }
+
+    // Скачивает оригинальный мастер-файл автора (WAV / FLAC / AIFF / OGG) через OAuth2
+    juce::File downloadMasterFileSync (SoundResult& sound)
+    {
+        if (sound.id <= 0)
+            return {};
+
+        auto existing = findExistingLocalFile (sound.id, sound.name, sound.formatType);
+        if (existing.existsAsFile())
+        {
+            sound.localFile = existing;
+            if (currentSampleMeta.id == sound.id)
+                currentSampleMeta.localFile = existing;
+            return existing;
+        }
+
+        sampleDirectory.createDirectory();
+
+        if (hasValidOAuth())
+        {
+            juce::MemoryBlock masterData;
+            bool ok = downloadStreamWithBearer (sound.id, oauthAccessToken.trim(), masterData);
+
+            if (!ok && oauthRefreshToken.isNotEmpty())
+            {
+                if (refreshOAuthTokenSync())
+                    ok = downloadStreamWithBearer (sound.id, oauthAccessToken.trim(), masterData);
+            }
+
+            if (ok && masterData.getSize() > 256)
+            {
+                auto target = getSampleFileFor (sound.id, sound.name, sound.formatType);
+                if (target.replaceWithData (masterData.getData(), masterData.getSize()))
+                {
+                    sound.localFile = target;
+                    if (currentSampleMeta.id == sound.id)
+                        currentSampleMeta.localFile = target;
+                    return target;
+                }
+            }
+        }
+
+        // Запасной вариант (если OAuth2 не подключён — сохраняет из RAM-кэша или HQ превью)
+        juce::MemoryBlock ramMb;
+        if (!getRamCachedMp3 (sound.id, ramMb) && sound.previewUrl.isNotEmpty())
+        {
+            juce::URL pUrl (sound.previewUrl);
+            auto opts = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                            .withConnectionTimeoutMs (12000);
+            if (auto stream = pUrl.createInputStream (opts))
+            {
+                stream->readIntoMemoryBlock (ramMb);
+                if (ramMb.getSize() > 0)
+                    storeRamCachedMp3 (sound.id, ramMb);
+            }
+        }
+
+        if (ramMb.getSize() > 0)
+        {
+            auto fallbackTarget = getSampleFileFor (sound.id, sound.name, "mp3");
+            if (fallbackTarget.replaceWithData (ramMb.getData(), ramMb.getSize()))
+            {
+                sound.localFile = fallbackTarget;
+                if (currentSampleMeta.id == sound.id)
+                    currentSampleMeta.localFile = fallbackTarget;
+                return fallbackTarget;
+            }
+        }
+
+        return {};
     }
 
     void storeRamCachedMp3 (int soundId, const juce::MemoryBlock& mb)
@@ -211,7 +470,7 @@ public:
             return;
 
         const juce::ScopedLock sl (ramCacheLock);
-        if (ramMp3Cache.size() >= 45 && ramMp3Cache.find (soundId) == ramMp3Cache.end())
+        if (ramMp3Cache.size() >= 40 && ramMp3Cache.find (soundId) == ramMp3Cache.end())
             ramMp3Cache.erase (ramMp3Cache.begin());
 
         ramMp3Cache[soundId] = mb;
@@ -229,41 +488,13 @@ public:
         return false;
     }
 
-    // Мгновенно материализует сэмпл из RAM-кэша на диск (при нажатии Get, Сердечка или при Drag-and-Drop)
-    juce::File materializeSoundToDisk (SoundResult& sound)
-    {
-        if (sound.id <= 0)
-            return {};
-
-        auto target = getSampleFileFor (sound.id, sound.name);
-        if (target.existsAsFile())
-        {
-            sound.localFile = target;
-            if (currentSampleMeta.id == sound.id)
-                currentSampleMeta.localFile = target;
-            return target;
-        }
-
-        juce::MemoryBlock mb;
-        if (getRamCachedMp3 (sound.id, mb))
-        {
-            sampleDirectory.createDirectory();
-            if (target.replaceWithData (mb.getData(), mb.getSize()))
-            {
-                sound.localFile = target;
-                if (currentSampleMeta.id == sound.id)
-                    currentSampleMeta.localFile = target;
-                return target;
-            }
-        }
-
-        return {};
-    }
-
     void saveGlobalSettings()
     {
         juce::ValueTree tree ("FreesoundMiniGlobalSettings");
+        tree.setProperty ("clientId", savedClientId, nullptr);
         tree.setProperty ("apiToken", savedToken, nullptr);
+        tree.setProperty ("oauthAccessToken", oauthAccessToken, nullptr);
+        tree.setProperty ("oauthRefreshToken", oauthRefreshToken, nullptr);
         tree.setProperty ("saveDirectory", sampleDirectory.getFullPathName(), nullptr);
 
         if (auto xml = tree.createXml())
@@ -280,9 +511,21 @@ public:
                 auto tree = juce::ValueTree::fromXml (*xml);
                 if (tree.isValid())
                 {
+                    auto cid = tree.getProperty ("clientId", "").toString().trim();
+                    if (cid.isNotEmpty())
+                        savedClientId = cid;
+
                     auto tok = tree.getProperty ("apiToken", "").toString().trim();
                     if (tok.isNotEmpty())
                         savedToken = tok;
+
+                    auto acc = tree.getProperty ("oauthAccessToken", "").toString().trim();
+                    if (acc.isNotEmpty())
+                        oauthAccessToken = acc;
+
+                    auto ref = tree.getProperty ("oauthRefreshToken", "").toString().trim();
+                    if (ref.isNotEmpty())
+                        oauthRefreshToken = ref;
 
                     auto dir = tree.getProperty ("saveDirectory", "").toString().trim();
                     if (dir.isNotEmpty())
@@ -320,25 +563,6 @@ public:
         r.name = c.getProperty ("name", "").toString();
         r.duration = (double) c.getProperty ("duration", 0.0);
         r.previewUrl = c.getProperty ("previewUrl", "").toString();
-
-        auto fPath = c.getProperty ("localFile", "").toString();
-        if (fPath.isNotEmpty())
-        {
-            juce::File f (fPath);
-            if (f.existsAsFile())
-                r.localFile = f;
-        }
-
-        if (!r.localFile.existsAsFile())
-        {
-            auto sampleFile = getSampleFileFor (r.id, r.name);
-            auto favCopy = getFavoriteFileFor (r.id, r.name);
-            if (sampleFile.existsAsFile())
-                r.localFile = sampleFile;
-            else if (favCopy.existsAsFile())
-                r.localFile = favCopy;
-        }
-
         r.username = c.getProperty ("username", "").toString();
         r.packName = c.getProperty ("packName", "").toString();
         r.formatType = c.getProperty ("formatType", "").toString();
@@ -349,6 +573,18 @@ public:
         r.tags.addTokens (c.getProperty ("tags", "").toString(), ",", "");
         r.detectedBpmKey = c.getProperty ("detectedBpmKey", "").toString();
         r.isPinnedRef = (bool) c.getProperty ("isPinnedRef", false);
+
+        auto fPath = c.getProperty ("localFile", "").toString();
+        if (fPath.isNotEmpty())
+        {
+            juce::File f (fPath);
+            if (f.existsAsFile())
+                r.localFile = f;
+        }
+
+        if (!r.localFile.existsAsFile())
+            r.localFile = findExistingLocalFile (r.id, r.name, r.formatType);
+
         return r;
     }
 
@@ -399,7 +635,9 @@ public:
 
     void setSoundFavorite (SoundResult& sound, bool shouldBeFav)
     {
-        auto favFile = getFavoriteFileFor (sound.id, sound.name);
+        auto favFile = getFavoriteFileFor (sound.id, sound.name, sound.formatType);
+        auto favMp3  = getFavoriteFileFor (sound.id, sound.name, "mp3");
+
         {
             const juce::ScopedLock sl (favLock);
             auto it = std::remove_if (favoriteItems.begin(), favoriteItems.end(),
@@ -408,21 +646,21 @@ public:
 
             if (shouldBeFav)
             {
-                if (!sound.localFile.existsAsFile())
-                    materializeSoundToDisk (sound);
-
                 SoundResult copy = sound;
                 copy.isPinnedRef = false;
                 if (sound.localFile.existsAsFile())
                 {
-                    sound.localFile.copyFileTo (favFile);
+                    auto ext = sound.localFile.getFileExtension();
+                    auto targetFav = favFile.withFileExtension (ext);
+                    sound.localFile.copyFileTo (targetFav);
                     copy.localFile = sound.localFile;
                 }
                 favoriteItems.push_back (copy);
             }
-            else if (favFile.existsAsFile())
+            else
             {
-                favFile.deleteFile();
+                if (favFile.existsAsFile()) favFile.deleteFile();
+                if (favMp3.existsAsFile())  favMp3.deleteFile();
             }
         }
         saveFavoritesIndex();
@@ -466,7 +704,10 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override
     {
         juce::ValueTree tree ("FreesoundMiniInstanceState");
+        tree.setProperty ("clientId", savedClientId, nullptr);
         tree.setProperty ("apiToken", savedToken, nullptr);
+        tree.setProperty ("oauthAccessToken", oauthAccessToken, nullptr);
+        tree.setProperty ("oauthRefreshToken", oauthRefreshToken, nullptr);
         tree.setProperty ("saveDirectory", sampleDirectory.getFullPathName(), nullptr);
         tree.setProperty ("query", persistedQuery, nullptr);
         tree.setProperty ("minSlider", persistedMinSlider, nullptr);
@@ -502,9 +743,21 @@ public:
             auto tree = juce::ValueTree::fromXml (*xmlState);
             if (tree.isValid())
             {
+                auto cid = tree.getProperty ("clientId", "").toString().trim();
+                if (cid.isNotEmpty())
+                    savedClientId = cid;
+
                 auto tok = tree.getProperty ("apiToken", "").toString().trim();
                 if (tok.isNotEmpty())
                     savedToken = tok;
+
+                auto acc = tree.getProperty ("oauthAccessToken", "").toString().trim();
+                if (acc.isNotEmpty())
+                    oauthAccessToken = acc;
+
+                auto ref = tree.getProperty ("oauthRefreshToken", "").toString().trim();
+                if (ref.isNotEmpty())
+                    oauthRefreshToken = ref;
 
                 auto dir = tree.getProperty ("saveDirectory", "").toString().trim();
                 if (dir.isNotEmpty())
@@ -537,13 +790,14 @@ public:
             }
         }
 
-        if (savedToken.isEmpty())
+        if (savedToken.isEmpty() || oauthAccessToken.isEmpty())
             loadGlobalSettings();
     }
 
     juce::String loadAndPlayFromReader (std::unique_ptr<juce::AudioFormatReader> reader,
                                         const SoundResult& meta,
-                                        bool resetPitchToZero)
+                                        bool resetPitchToZero,
+                                        bool autoStartPlayback = true)
     {
         if (reader == nullptr)
             return {};
@@ -582,7 +836,7 @@ public:
             cachedBuffer = std::move (tempBuf);
         }
 
-        rebuildTransport (0.0, true);
+        rebuildTransport (0.0, autoStartPlayback);
         return badgeText;
     }
 
@@ -594,10 +848,9 @@ public:
         std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
         SoundResult updatedMeta = meta;
         updatedMeta.localFile = file;
-        return loadAndPlayFromReader (std::move (reader), updatedMeta, resetPitchToZero);
+        return loadAndPlayFromReader (std::move (reader), updatedMeta, resetPitchToZero, true);
     }
 
-    // Загрузка и проигрывание напрямую из оперативной памяти (без записи файла на диск)
     juce::String loadAndPlayMemoryBlock (const juce::MemoryBlock& mb, const SoundResult& meta, bool resetPitchToZero)
     {
         if (mb.getSize() == 0)
@@ -605,7 +858,13 @@ public:
 
         auto memStream = std::make_unique<juce::MemoryInputStream> (mb, false);
         std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (std::move (memStream)));
-        return loadAndPlayFromReader (std::move (reader), meta, resetPitchToZero);
+        return loadAndPlayFromReader (std::move (reader), meta, resetPitchToZero, true);
+    }
+
+    void updateCurrentSampleLocalFile (int soundId, const juce::File& file)
+    {
+        if (currentSampleMeta.id == soundId && file.existsAsFile())
+            currentSampleMeta.localFile = file;
     }
 
     void rebuildTransport (double startPosSeconds, bool autoStart)
@@ -735,7 +994,10 @@ public:
 
     SoundResult getCurrentSampleMeta() const { return currentSampleMeta; }
 
+    juce::String savedClientId;
     juce::String savedToken;
+    juce::String oauthAccessToken;
+    juce::String oauthRefreshToken;
     juce::File sampleDirectory;
 
     juce::CriticalSection stateLock;
@@ -924,6 +1186,7 @@ private:
     mutable juce::CriticalSection ramCacheLock;
     std::map<int, juce::MemoryBlock> ramMp3Cache;
 
+    mutable juce::CriticalSection oauthLock;
     mutable juce::CriticalSection favLock;
     std::vector<SoundResult> favoriteItems;
 
@@ -942,7 +1205,8 @@ struct HeartRenderer
         juce::Path p;
         float w = std::min (area.getWidth(), area.getHeight());
         float cx = area.getCentreX();
-        float cy = area.getCentreY() + w * 0.04f;
+        // Оптическое центрирование по высоте (приподнято на ~2.5 px для идеального выравнивания с кубиком)
+        float cy = area.getCentreY() - w * 0.075f;
         float s = w * 0.45f;
 
         p.startNewSubPath (cx, cy + s * 0.85f);
@@ -981,11 +1245,12 @@ class ApiStatusBadge : public juce::Button
 public:
     ApiStatusBadge() : juce::Button ("") {}
 
-    void setConnected (bool connected)
+    void setStatus (bool apiReady, bool oauthReady)
     {
-        if (isConnected != connected)
+        if (isApiReady != apiReady || isOAuthReady != oauthReady)
         {
-            isConnected = connected;
+            isApiReady = apiReady;
+            isOAuthReady = oauthReady;
             repaint();
         }
     }
@@ -993,7 +1258,9 @@ public:
     void paintButton (juce::Graphics& g, bool isMouseOver, bool) override
     {
         auto b = getLocalBounds().toFloat().reduced (1.0f);
-        juce::Colour accent = isConnected ? juce::Colour (0xff52b788) : juce::Colours::indianred;
+        bool ok = isOAuthReady || isApiReady;
+        juce::Colour accent = isOAuthReady ? juce::Colour (0xff52b788)
+                            : (isApiReady ? juce::Colour (0xffcca43b) : juce::Colours::indianred);
         juce::Colour bg = isMouseOver ? juce::Colour (0xff1c2226) : juce::Colour (0xff14161a);
 
         g.setColour (bg);
@@ -1011,7 +1278,7 @@ public:
         g.drawEllipse (cx - r, cy - r, r * 2.0f, r * 2.0f, 1.2f);
 
         juce::Path icon;
-        if (isConnected)
+        if (ok)
         {
             icon.startNewSubPath (cx - 3.2f, cy + 0.2f);
             icon.lineTo (cx - 0.8f, cy + 2.6f);
@@ -1027,16 +1294,16 @@ public:
         g.strokePath (icon, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
         g.setColour (accent);
-        juce::String labelText = isConnected ? (isMouseOver ? "API OK (Edit)" : "API OK") : "NO API";
+        juce::String labelText = isOAuthReady ? "API OK" : (isApiReady ? "API (MP3)" : "SETUP API");
         g.drawText (labelText, (int) (cx + 10.0f), 0, getWidth() - (int) (cx + 14.0f), getHeight(), juce::Justification::centredLeft);
     }
 
 private:
-    bool isConnected = false;
+    bool isApiReady = false;
+    bool isOAuthReady = false;
 };
 
 //==============================================================================
-// Сдвоенный блок управления папкой [ Выбрать папку | Открыть в Finder ] под единой рамкой
 class SegmentedFolderControl : public juce::Component
 {
 public:
@@ -1109,7 +1376,6 @@ public:
         g.setColour (juce::Colour (0xff262930));
         g.drawVerticalLine ((int) std::round (midX), b.getY() + 4.0f, b.getBottom() - 4.0f);
 
-        // Левая половина: Иконка папки
         {
             float cx = b.getX() + b.getWidth() * 0.25f;
             float cy = b.getCentreY();
@@ -1130,7 +1396,6 @@ public:
             g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
-        // Правая половина: Иконка открытия в Finder
         {
             float cx = b.getX() + b.getWidth() * 0.75f;
             float cy = b.getCentreY();
@@ -1885,70 +2150,297 @@ public:
 };
 
 //==============================================================================
+// Интерактивный центр настройки OAuth2 и руководство
 class InfoOverlay : public juce::Component
 {
 public:
-    explicit InfoOverlay (std::function<void()> closeCallback) : onClose (std::move (closeCallback))
+    InfoOverlay (FreesoundMiniAudioProcessor& p,
+                 std::function<void()> closeCallback,
+                 std::function<void()> authChangedCallback)
+        : proc (p),
+          onClose (std::move (closeCallback)),
+          onAuthChanged (std::move (authChangedCallback))
     {
         setInterceptsMouseClicks (true, true);
 
         closeButton.onClick = [this] { if (onClose) onClose(); };
         addAndMakeVisible (closeButton);
 
-        apiLink.setButtonText ("https://freesound.org/apiv2/apply/");
-        apiLink.setURL (juce::URL ("https://freesound.org/apiv2/apply/"));
-        apiLink.setJustificationType (juce::Justification::centredLeft);
-        apiLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff52b788));
-        addAndMakeVisible (apiLink);
+        applyLink.setButtonText ("https://freesound.org/apiv2/apply/");
+        applyLink.setURL (juce::URL ("https://freesound.org/apiv2/apply/"));
+        applyLink.setJustificationType (juce::Justification::centredLeft);
+        applyLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff52b788));
+        addAndMakeVisible (applyLink);
+
+        clientIdInput.setTextToShowWhenEmpty ("Paste Client ID here...", juce::Colours::grey);
+        clientIdInput.setJustification (juce::Justification::centredLeft);
+        clientIdInput.setIndents (6, 4);
+        clientIdInput.onTextChange = [this] {
+            proc.savedClientId = clientIdInput.getText().trim();
+            proc.saveGlobalSettings();
+        };
+        addAndMakeVisible (clientIdInput);
+
+        clientSecretInput.setTextToShowWhenEmpty ("Paste Client Secret / API Key here...", juce::Colours::grey);
+        clientSecretInput.setJustification (juce::Justification::centredLeft);
+        clientSecretInput.setIndents (6, 4);
+        clientSecretInput.onTextChange = [this] {
+            proc.savedToken = clientSecretInput.getText().trim();
+            proc.saveGlobalSettings();
+            if (onAuthChanged) onAuthChanged();
+        };
+        addAndMakeVisible (clientSecretInput);
+
+        openAuthUrlBtn.setButtonText ("Open Freesound Login in Browser");
+        openAuthUrlBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1d2b24));
+        openAuthUrlBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff52b788));
+        openAuthUrlBtn.onClick = [this] {
+            auto cid = clientIdInput.getText().trim();
+            auto sec = clientSecretInput.getText().trim();
+            if (cid.isEmpty() || sec.isEmpty())
+            {
+                feedbackLabel.setColour (juce::Label::textColourId, juce::Colours::indianred);
+                feedbackLabel.setText ("Enter Client ID and Client Secret in Step 2 first!", juce::dontSendNotification);
+                return;
+            }
+            proc.savedClientId = cid;
+            proc.savedToken = sec;
+            proc.saveGlobalSettings();
+
+            juce::String authUrl = "https://freesound.org/apiv2/oauth2/authorize/?client_id="
+                                 + juce::URL::addEscapeChars (cid, true)
+                                 + "&response_type=code";
+            juce::URL (authUrl).launchInDefaultBrowser();
+            feedbackLabel.setColour (juce::Label::textColourId, juce::Colour (0xff74c69d));
+            feedbackLabel.setText ("Browser opened! Click 'Authorize' & paste code below.", juce::dontSendNotification);
+        };
+        addAndMakeVisible (openAuthUrlBtn);
+
+        authCodeInput.setTextToShowWhenEmpty ("Paste Authorization Code from browser...", juce::Colours::grey);
+        authCodeInput.setJustification (juce::Justification::centredLeft);
+        authCodeInput.setIndents (6, 4);
+        authCodeInput.onReturnKey = [this] { performTokenExchange(); };
+        addAndMakeVisible (authCodeInput);
+
+        connectBtn.setButtonText ("Connect & Activate Master WAV");
+        connectBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff52b788));
+        connectBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff0a0b0d));
+        connectBtn.onClick = [this] { performTokenExchange(); };
+        addAndMakeVisible (connectBtn);
+
+        feedbackLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+        feedbackLabel.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (feedbackLabel);
+
+        reconfigureBtn.setButtonText ("Reconfigure / Change Account");
+        reconfigureBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1a1d24));
+        reconfigureBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::lightgrey);
+        reconfigureBtn.onClick = [this] {
+            forceSetupMode = true;
+            syncVisibilityWithState();
+        };
+        addAndMakeVisible (reconfigureBtn);
+
+        openSamplesDirBtn.setButtonText ("Open Saved Samples Folder");
+        openSamplesDirBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1d2b24));
+        openSamplesDirBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff52b788));
+        openSamplesDirBtn.onClick = [this] {
+            proc.sampleDirectory.startAsProcess();
+        };
+        addAndMakeVisible (openSamplesDirBtn);
+
+        syncVisibilityWithState();
+    }
+
+    void refreshFromProcessor (bool openInSetupIfNoOAuth = false)
+    {
+        clientIdInput.setText (proc.savedClientId, false);
+        clientSecretInput.setText (proc.savedToken, false);
+        if (openInSetupIfNoOAuth && !proc.hasValidOAuth())
+            forceSetupMode = true;
+        syncVisibilityWithState();
     }
 
     void mouseDown (const juce::MouseEvent&) override {}
 
     void paint (juce::Graphics& g) override
     {
-        g.fillAll (juce::Colour (0xff0a0b0d).withAlpha (0.95f));
+        g.fillAll (juce::Colour (0xff0a0b0d).withAlpha (0.96f));
 
-        auto card = getLocalBounds().reduced (18).toFloat();
+        auto card = getLocalBounds().reduced (14).toFloat();
         g.setColour (juce::Colour (0xff14161a));
         g.fillRoundedRectangle (card, 12.0f);
-        g.setColour (juce::Colour (0xff52b788).withAlpha (0.4f));
+        g.setColour (juce::Colour (0xff52b788).withAlpha (0.45f));
         g.drawRoundedRectangle (card, 12.0f, 1.0f);
 
-        auto area = getLocalBounds().reduced (32);
-        g.setColour (juce::Colour (0xff52b788));
-        g.drawText ("FREESOUND MINI - GUIDE", area.removeFromTop (30), juce::Justification::centredLeft);
+        int x = 28;
+        int w = getWidth() - 56;
 
-        g.setColour (juce::Colours::lightgrey);
-        g.drawText ("1. API Key (Saved Globally):", area.removeFromTop (20), juce::Justification::centredLeft);
-        area.removeFromTop (24);
+        if (showingConnectedView)
+        {
+            g.setColour (juce::Colour (0xff52b788));
+            g.setFont (15.0f);
+            g.drawText ("FREESOUND MINI - READY TO WORK", x, 26, w - 32, 24, juce::Justification::centredLeft);
 
-        g.drawFittedText ("Paste key & press Enter. Click 'API OK' anytime to edit.",
-                          area.removeFromTop (28), juce::Justification::topLeft, 2);
+            juce::Rectangle<float> statusBox ((float) x, 58.0f, (float) w, 64.0f);
+            g.setColour (juce::Colour (0xff17261f));
+            g.fillRoundedRectangle (statusBox, 8.0f);
+            g.setColour (juce::Colour (0xff52b788).withAlpha (0.6f));
+            g.drawRoundedRectangle (statusBox, 8.0f, 1.0f);
 
-        area.removeFromTop (6);
+            g.setColour (juce::Colour (0xff52b788));
+            g.setFont (13.5f);
+            g.drawText ("OAuth2 Active: Original Master Downloads Enabled", x + 12, 66, w - 24, 20, juce::Justification::centredLeft);
 
-        juce::String text =
-            "2. Clean Disk & RAM Preview:\n"
-            "   Clicking any row previews audio in RAM without cluttering your disk.\n"
-            "   Files save to disk ONLY when you click 'Get', Heart, or Drag to Ableton.\n\n"
-            "3. Transport & Shortcuts:\n"
-            "   Single Space: Play/Pause. Double Space: Stop. Up/Down: Navigate.\n\n"
-            "4. Right-Click Menu:\n"
-            "   Right-click any row for Show Similar (pins [REF]) or Open in Browser.";
+            g.setColour (juce::Colours::lightgrey);
+            g.setFont (12.0f);
+            g.drawText ("All downloads ('Get', Heart, Drag-and-Drop) save lossless WAV / FLAC / AIFF.",
+                        x + 12, 88, w - 24, 26, juce::Justification::centredLeft);
 
-        g.drawFittedText (text, area, juce::Justification::topLeft, 20);
+            g.setColour (juce::Colours::white);
+            g.setFont (13.0f);
+            g.drawText ("Quick Workflow Guide:", x, 136, w, 20, juce::Justification::centredLeft);
+
+            g.setColour (juce::Colours::lightgrey);
+            g.setFont (12.0f);
+            juce::String guideText =
+                "1. Instant RAM Preview & Lookahead:\n"
+                "   Use Up / Down arrows to browse. Audio streams into RAM with zero disk clutter,\n"
+                "   aborting skipped sounds and pre-loading the next rows automatically.\n\n"
+                "2. Master File Saving & Multi-Drag:\n"
+                "   Click 'Get', Heart, or drag rows/waveform directly into Ableton Live to pull\n"
+                "   the author's original uncompressed studio file. Hold Shift/Cmd for multi-drag.\n\n"
+                "3. Transport & Waveform:\n"
+                "   Space: Play/Pause | 2x Space: Stop | Top-left waveform icon: Normal / Reverse / Loop.\n"
+                "   Right-click any row for 'Show Similar Sounds' (pins [REF] at top).";
+
+            g.drawFittedText (guideText, x, 160, w, 245, juce::Justification::topLeft, 18);
+
+            g.setColour (juce::Colours::grey);
+            g.drawText ("API Management Page:", x, getHeight() - 122, w, 16, juce::Justification::centredLeft);
+        }
+        else
+        {
+            g.setColour (juce::Colour (0xff52b788));
+            g.setFont (15.0f);
+            g.drawText ("FREESOUND OAUTH2 - ONE-TIME SETUP", x, 24, w - 32, 24, juce::Justification::centredLeft);
+
+            g.setColour (juce::Colours::lightgrey);
+            g.setFont (12.0f);
+            g.drawFittedText ("Authorize once to unlock direct downloads of original uncompressed WAV / FLAC / AIFF files.",
+                              x, 48, w, 30, juce::Justification::topLeft, 2);
+
+            g.setColour (juce::Colours::white);
+            g.drawText ("Step 1. Create or open your API app on Freesound:", x, 84, w, 18, juce::Justification::centredLeft);
+
+            g.setColour (juce::Colours::grey);
+            g.setFont (11.5f);
+            g.drawText ("(Keep default Redirect URI: .../permission_granted/)", x, 122, w, 16, juce::Justification::centredLeft);
+
+            g.setColour (juce::Colours::white);
+            g.setFont (12.0f);
+            g.drawText ("Step 2. Paste your Client ID & Client Secret (API Key):", x, 148, w, 18, juce::Justification::centredLeft);
+            g.setColour (juce::Colours::grey);
+            g.drawText ("Client ID:", x, 172, 90, 26, juce::Justification::centredLeft);
+            g.drawText ("Client Secret:", x, 204, 90, 26, juce::Justification::centredLeft);
+
+            g.setColour (juce::Colours::white);
+            g.drawText ("Step 3. Click to log in & authorize in your browser:", x, 244, w, 18, juce::Justification::centredLeft);
+
+            g.drawText ("Step 4. Paste the Authorization Code shown in browser:", x, 308, w, 18, juce::Justification::centredLeft);
+        }
     }
 
     void resized() override
     {
-        closeButton.setBounds (getWidth() - 52, 26, 26, 26);
-        apiLink.setBounds (32, 80, getWidth() - 64, 22);
+        closeButton.setBounds (getWidth() - 48, 22, 26, 26);
+
+        int x = 28;
+        int w = getWidth() - 56;
+
+        if (showingConnectedView)
+        {
+            applyLink.setBounds (x, getHeight() - 104, w, 20);
+            openSamplesDirBtn.setBounds (x, getHeight() - 76, w, 26);
+            reconfigureBtn.setBounds (x, getHeight() - 44, w, 24);
+        }
+        else
+        {
+            applyLink.setBounds (x, 102, w, 20);
+            clientIdInput.setBounds (x + 88, 172, w - 88, 26);
+            clientSecretInput.setBounds (x + 88, 204, w - 88, 26);
+            openAuthUrlBtn.setBounds (x, 266, w, 28);
+            authCodeInput.setBounds (x, 330, w, 28);
+            connectBtn.setBounds (x, 366, w, 30);
+            feedbackLabel.setBounds (x, 402, w, 24);
+        }
     }
 
 private:
+    void syncVisibilityWithState()
+    {
+        showingConnectedView = proc.hasValidOAuth() && !forceSetupMode;
+
+        applyLink.setVisible (true);
+        clientIdInput.setVisible (!showingConnectedView);
+        clientSecretInput.setVisible (!showingConnectedView);
+        openAuthUrlBtn.setVisible (!showingConnectedView);
+        authCodeInput.setVisible (!showingConnectedView);
+        connectBtn.setVisible (!showingConnectedView);
+        feedbackLabel.setVisible (!showingConnectedView);
+
+        reconfigureBtn.setVisible (showingConnectedView);
+        openSamplesDirBtn.setVisible (showingConnectedView);
+
+        resized();
+        repaint();
+    }
+
+    void performTokenExchange()
+    {
+        auto cid = clientIdInput.getText().trim();
+        auto sec = clientSecretInput.getText().trim();
+        auto code = authCodeInput.getText().trim();
+
+        feedbackLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+        feedbackLabel.setText ("Connecting to Freesound...", juce::dontSendNotification);
+
+        juce::String err;
+        if (proc.exchangeAuthCodeForTokensSync (cid, sec, code, err))
+        {
+            authCodeInput.clear();
+            forceSetupMode = false;
+            feedbackLabel.setColour (juce::Label::textColourId, juce::Colour (0xff52b788));
+            feedbackLabel.setText ("Connected! Master WAV downloads enabled.", juce::dontSendNotification);
+            if (onAuthChanged)
+                onAuthChanged();
+            syncVisibilityWithState();
+        }
+        else
+        {
+            feedbackLabel.setColour (juce::Label::textColourId, juce::Colours::indianred);
+            feedbackLabel.setText (err, juce::dontSendNotification);
+        }
+    }
+
+    FreesoundMiniAudioProcessor& proc;
     std::function<void()> onClose;
+    std::function<void()> onAuthChanged;
+
+    bool showingConnectedView = false;
+    bool forceSetupMode = false;
+
     IconButton closeButton { IconButton::Close };
-    juce::HyperlinkButton apiLink;
+    juce::HyperlinkButton applyLink;
+    juce::TextEditor clientIdInput;
+    juce::TextEditor clientSecretInput;
+    juce::TextButton openAuthUrlBtn;
+    juce::TextEditor authCodeInput;
+    juce::TextButton connectBtn;
+    juce::Label feedbackLabel;
+
+    juce::TextButton reconfigureBtn;
+    juce::TextButton openSamplesDirBtn;
 };
 
 //==============================================================================
@@ -1965,33 +2457,15 @@ public:
         setLookAndFeel (&modernLF);
         setWantsKeyboardFocus (true);
 
-        if (proc.savedToken.isEmpty())
+        if (proc.savedToken.isEmpty() || proc.oauthAccessToken.isEmpty())
             proc.loadGlobalSettings();
 
-        isEditingToken = (proc.savedToken.trim().length() <= 5);
-
-        tokenInput.setTextToShowWhenEmpty ("Paste API Key & press Enter...", juce::Colours::grey);
-        tokenInput.setJustification (juce::Justification::centredLeft);
-        tokenInput.setText (proc.savedToken, false);
-        tokenInput.onTextChange = [this] {
-            proc.savedToken = tokenInput.getText().trim();
-            proc.saveGlobalSettings();
-            apiStatusBadge.setConnected (proc.savedToken.length() > 5);
-        };
-        tokenInput.onReturnKey = [this] { commitTokenAndHideIfValid(); };
-        tokenInput.onFocusLost = [this] { commitTokenAndHideIfValid(); };
-        addAndMakeVisible (tokenInput);
-
-        apiStatusBadge.setConnected (proc.savedToken.trim().length() > 5);
+        apiStatusBadge.setStatus (proc.hasValidApiKey(), proc.hasValidOAuth());
         apiStatusBadge.onClick = [this] {
-            isEditingToken = !isEditingToken;
-            updateTopBarVisibility();
-            if (isEditingToken)
-                tokenInput.grabKeyboardFocus();
+            openInfoOverlay (true);
         };
         addAndMakeVisible (apiStatusBadge);
 
-        // Сдвоенный блок [ Выбрать папку | Открыть в Finder ]
         folderControl.onChooseFolder = [this] {
             fileChooser = std::make_unique<juce::FileChooser> ("Choose Sample Folder",
                                                                proc.sampleDirectory,
@@ -2017,12 +2491,7 @@ public:
         addAndMakeVisible (folderControl);
 
         infoButton.onClick = [this] {
-            if (infoOverlay != nullptr)
-            {
-                infoOverlay->setBounds (getLocalBounds());
-                infoOverlay->setVisible (true);
-                infoOverlay->toFront (true);
-            }
+            openInfoOverlay (false);
         };
         addAndMakeVisible (infoButton);
 
@@ -2030,7 +2499,6 @@ public:
         backHistoryButton.setEnabled (!proc.searchHistory.empty());
         addAndMakeVisible (backHistoryButton);
 
-        // Поле поиска (поиск по Enter, без лишней кнопки лупы)
         searchInput.setTextToShowWhenEmpty ("Search sounds (press Enter)...", juce::Colours::grey);
         searchInput.setJustification (juce::Justification::centredLeft);
         searchInput.setIndents (6, 4);
@@ -2127,11 +2595,16 @@ public:
             if (cur.id > 0)
             {
                 bool nowFav = !proc.isSoundFavorite (cur.id);
-                proc.setSoundFavorite (cur, nowFav);
-
-                if (cur.localFile.existsAsFile())
-                    updateRowLocalFile (cur.id, cur.localFile);
-
+                if (nowFav && !cur.localFile.existsAsFile())
+                {
+                    int rowIdx = findRowBySoundId (cur.id);
+                    if (rowIdx >= 0)
+                        triggerMasterDownloadAsync (rowIdx, true);
+                }
+                else
+                {
+                    proc.setSoundFavorite (cur, nowFav);
+                }
                 waveformDisplay.updateFavoriteState (nowFav);
                 table.repaint();
             }
@@ -2185,7 +2658,15 @@ public:
         statusLabel.setBorderSize (juce::BorderSize<int> (0));
         addAndMakeVisible (statusLabel);
 
-        infoOverlay = std::make_unique<InfoOverlay> ([this] { infoOverlay->setVisible (false); });
+        infoOverlay = std::make_unique<InfoOverlay> (
+            proc,
+            [this] {
+                infoOverlay->setVisible (false);
+                apiStatusBadge.setStatus (proc.hasValidApiKey(), proc.hasValidOAuth());
+            },
+            [this] {
+                apiStatusBadge.setStatus (proc.hasValidApiKey(), proc.hasValidOAuth());
+            });
         infoOverlay->setVisible (false);
         addChildComponent (infoOverlay.get());
 
@@ -2205,17 +2686,20 @@ public:
         if (!results.empty())
             statusLabel.setText ("Restored: " + juce::String (getNumRows()) + " sounds", juce::dontSendNotification);
 
-        updateTopBarVisibility();
         refreshWaveformFromProcessor();
         playPauseButton.setActiveState (proc.isAudioPlaying());
 
         setResizable (true, true);
         setResizeLimits (370, 540, 1100, 1200);
         setSize (400, 620);
+
+        if (!proc.isReadyToUse())
+            openInfoOverlay (true);
     }
 
     ~FreesoundMiniEditor() override
     {
+        ++previewRequestGeneration;
         stopTimer();
         signalThreadShouldExit();
         stopThread (4000);
@@ -2224,7 +2708,10 @@ public:
 
     bool keyPressed (const juce::KeyPress& key) override
     {
-        if (key == juce::KeyPress::spaceKey && !searchInput.hasKeyboardFocus (false) && !tokenInput.hasKeyboardFocus (false))
+        if (infoOverlay != nullptr && infoOverlay->isVisible())
+            return AudioProcessorEditor::keyPressed (key);
+
+        if (key == juce::KeyPress::spaceKey && !searchInput.hasKeyboardFocus (false))
         {
             double now = juce::Time::getMillisecondCounterHiRes();
             if (now - lastSpaceBarTimeMs < 320.0)
@@ -2268,27 +2755,15 @@ public:
     {
         auto area = getLocalBounds().reduced (12);
 
-        // Верхняя шапка: Статус API слева, сдвоенный блок [ Папка | Открыть ] + (i) справа
         auto topBar = area.removeFromTop (28);
         infoButton.setBounds (topBar.removeFromRight (28));
         topBar.removeFromRight (5);
         folderControl.setBounds (topBar.removeFromRight (56));
         topBar.removeFromRight (6);
-
-        if (tokenInput.isVisible())
-        {
-            apiStatusBadge.setBounds (topBar.removeFromLeft (86));
-            topBar.removeFromLeft (6);
-            tokenInput.setBounds (topBar);
-        }
-        else
-        {
-            apiStatusBadge.setBounds (topBar.removeFromLeft (115));
-        }
+        apiStatusBadge.setBounds (topBar.removeFromLeft (115));
 
         area.removeFromTop (8);
 
-        // Строка поиска: Назад (<-) + Поле поиска (с # внутри) + Кубик + Сердце
         auto searchRow = area.removeFromTop (30);
         favFilterButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (4);
@@ -2437,6 +2912,11 @@ public:
                 g.setColour (juce::Colour (0xff52b788));
                 g.drawText ("Ready", 0, 0, width, height, juce::Justification::centred);
             }
+            else if (item.isDownloadingMaster)
+            {
+                g.setColour (juce::Colour (0xff74c69d));
+                g.drawText ("...", 0, 0, width, height, juce::Justification::centred);
+            }
             else
             {
                 g.setColour (juce::Colour (0xffcca43b));
@@ -2467,45 +2947,55 @@ public:
         table.repaint();
     }
 
-    // При перетаскивании из таблицы мгновенно материализует выбранные звуки из RAM-кэша на диск
+    // При перетаскивании выбранных строк скачивает оригинальный мастер-формат (WAV / FLAC / AIFF) и передаёт в Ableton
     juce::var getDragSourceDescription (const juce::SparseSet<int>& currentlySelectedRows) override
     {
         juce::StringArray filesToDrag;
 
+        std::vector<SoundResult> itemsToMaterialize;
         {
             const juce::ScopedLock sl (resultsLock);
             for (int i = 0; i < currentlySelectedRows.size(); ++i)
             {
                 int r = currentlySelectedRows[i];
                 if (r >= 0 && r < static_cast<int> (results.size()))
-                {
-                    auto& item = results[static_cast<size_t> (r)];
-                    if (!item.localFile.existsAsFile())
-                        proc.materializeSoundToDisk (item);
-
-                    if (item.localFile.existsAsFile())
-                        filesToDrag.addIfNotAlreadyThere (item.localFile.getFullPathName());
-                }
+                    itemsToMaterialize.push_back (results[static_cast<size_t> (r)]);
             }
         }
 
-        syncStateToProcessor();
+        for (auto& item : itemsToMaterialize)
+        {
+            if (!item.localFile.existsAsFile())
+            {
+                statusLabel.setText ("Downloading Master " + item.formatType.toUpperCase() + " for DAW...", juce::dontSendNotification);
+                auto saved = proc.downloadMasterFileSync (item);
+                if (saved.existsAsFile())
+                    updateRowLocalFile (item.id, saved);
+            }
+
+            if (item.localFile.existsAsFile())
+                filesToDrag.addIfNotAlreadyThere (item.localFile.getFullPathName());
+        }
+
         table.repaint();
 
         if (!filesToDrag.isEmpty())
+        {
+            statusLabel.setText ("Dragging " + juce::String (filesToDrag.size()) + " master file(s) to Ableton!", juce::dontSendNotification);
             performExternalDragDropOfFiles (filesToDrag, false);
+        }
 
         return {};
     }
 
     void selectedRowsChanged (int lastRowSelected) override
     {
-        // При мультивыборе подгружаем превью только в RAM-кэш (диск не засоряется до реального перетаскивания)
+        // Если пользователь выделил несколько сэмплов (Shift/Cmd) — заранее подгружаем их оригиналы в фоне для мгновенного мульти-драга
         auto selected = table.getSelectedRows();
         if (selected.size() > 1)
         {
             for (int i = 0; i < selected.size(); ++i)
-                ensureRowInRamQuietly (selected[i]);
+                triggerMasterDownloadAsync (selected[i], false);
         }
 
         if (lastRowSelected >= 0 && lastRowSelected != lastTriggeredRow)
@@ -2546,41 +3036,32 @@ public:
             return;
         }
 
-        // Колонка 1: Сердечко (сохраняет на диск и в папку Favorites)
+        // Колонка 1 (Heart): скачивает оригинальный мастер-файл и сохраняет в Favorites
         if (columnId == 1)
         {
             bool makeFav = !proc.isSoundFavorite (item.id);
-            proc.setSoundFavorite (item, makeFav);
-
-            if (item.localFile.existsAsFile())
-                updateRowLocalFile (item.id, item.localFile);
-            else if (makeFav)
-                fetchSoundAsync (rowNumber, false, true);
-
-            if (proc.getCurrentSampleMeta().id == item.id)
-                waveformDisplay.updateFavoriteState (makeFav);
-
-            if (showingFavoritesOnly && !makeFav)
-                toggleFavoritesView (true);
+            if (makeFav && !item.localFile.existsAsFile())
+            {
+                triggerMasterDownloadAsync (rowNumber, true);
+            }
             else
-                table.repaintRow (rowNumber);
+            {
+                proc.setSoundFavorite (item, makeFav);
+                if (proc.getCurrentSampleMeta().id == item.id)
+                    waveformDisplay.updateFavoriteState (makeFav);
+
+                if (showingFavoritesOnly && !makeFav)
+                    toggleFavoritesView (true);
+                else
+                    table.repaintRow (rowNumber);
+            }
             return;
         }
 
-        // Колонка 4 (STATUS): Явное сохранение выбранного сэмпла на диск по клику на "Get"
+        // Колонка 4 (Get): скачивает оригинальный мастер-файл (WAV / FLAC / AIFF) в рабочую папку
         if (columnId == 4 && !item.localFile.existsAsFile())
         {
-            auto savedFile = proc.materializeSoundToDisk (item);
-            if (savedFile.existsAsFile())
-            {
-                updateRowLocalFile (item.id, savedFile);
-                table.repaintRow (rowNumber);
-                statusLabel.setText ("Saved to disk: " + savedFile.getFileName(), juce::dontSendNotification);
-            }
-            else
-            {
-                fetchSoundAsync (rowNumber, true, true);
-            }
+            triggerMasterDownloadAsync (rowNumber, false);
             return;
         }
 
@@ -2618,6 +3099,15 @@ public:
         table.updateContent();
         statusLabel.setText ("Loaded: " + juce::String (getNumRows()) + (hasMorePages ? "+ sounds (scroll for more)" : " sounds"),
                              juce::dontSendNotification);
+
+        // Сразу прогреваем первые 2 сэмпла выдачи в RAM, чтобы первый же клик сработал мгновенно
+        if (!append && getNumRows() > 0)
+        {
+            uint64_t gen = previewRequestGeneration.load();
+            prefetchRowIntoRamAsync (0, gen);
+            if (getNumRows() > 1)
+                prefetchRowIntoRamAsync (1, gen);
+        }
     }
 
     void applyStatusMessage (const juce::String& text)
@@ -2626,17 +3116,19 @@ public:
         statusLabel.setText (text, juce::dontSendNotification);
     }
 
-    void finishFetchForSound (int soundId, const juce::MemoryBlock& mb, const juce::File& savedDiskFile, bool shouldAutoPlay)
+    void finishRamPreviewFetch (int soundId, const juce::MemoryBlock& mb, uint64_t requestGen)
     {
-        if (mb.getSize() == 0 && !savedDiskFile.existsAsFile())
-        {
-            if (shouldAutoPlay)
-                statusLabel.setText ("Preview fetch failed.", juce::dontSendNotification);
-            return;
-        }
-
         if (mb.getSize() > 0)
             proc.storeRamCachedMp3 (soundId, mb);
+
+        if (requestGen != previewRequestGeneration.load())
+            return;
+
+        if (mb.getSize() == 0)
+        {
+            statusLabel.setText ("Preview stream failed.", juce::dontSendNotification);
+            return;
+        }
 
         SoundResult matchedMeta;
         int matchedRow = -1;
@@ -2647,8 +3139,6 @@ public:
             {
                 if (results[i].id == soundId)
                 {
-                    if (savedDiskFile.existsAsFile())
-                        results[i].localFile = savedDiskFile;
                     matchedMeta = results[i];
                     matchedRow = static_cast<int> (i);
                     break;
@@ -2656,28 +3146,9 @@ public:
             }
         }
 
-        if (proc.isSoundFavorite (soundId) && matchedMeta.id > 0)
-            proc.setSoundFavorite (matchedMeta, true);
-
-        if (matchedMeta.localFile.existsAsFile() && matchedRow >= 0)
+        if (matchedMeta.id > 0)
         {
-            const juce::ScopedLock sl (resultsLock);
-            results[static_cast<size_t> (matchedRow)].localFile = matchedMeta.localFile;
-        }
-
-        syncStateToProcessor();
-
-        if (matchedRow >= 0)
-            table.repaintRow (matchedRow);
-
-        if (shouldAutoPlay && matchedMeta.id > 0)
-        {
-            juce::String badge;
-            if (matchedMeta.localFile.existsAsFile())
-                badge = proc.loadAndPlayFile (matchedMeta.localFile, matchedMeta, true);
-            else
-                badge = proc.loadAndPlayMemoryBlock (mb, matchedMeta, true);
-
+            juce::String badge = proc.loadAndPlayMemoryBlock (mb, matchedMeta, true);
             {
                 const juce::ScopedLock sl (resultsLock);
                 if (matchedRow >= 0 && matchedRow < static_cast<int> (results.size()))
@@ -2686,14 +3157,86 @@ public:
             syncStateToProcessor();
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
-            statusLabel.setText (matchedMeta.localFile.existsAsFile()
-                                     ? "Saved & Playing. Drag to Ableton!"
-                                     : "RAM Preview (Disk clean). Click 'Get' or Drag to save.",
+            statusLabel.setText ("RAM Preview (" + matchedMeta.formatType.toUpperCase() + " master available via 'Get' or Drag)",
                                  juce::dontSendNotification);
+
+            // Упреждающий прогрев следующих 2 строк в RAM (Lookahead Prefetching)
+            if (matchedRow >= 0)
+            {
+                prefetchRowIntoRamAsync (matchedRow + 1, requestGen);
+                prefetchRowIntoRamAsync (matchedRow + 2, requestGen);
+            }
+        }
+    }
+
+    void finishMasterDownload (int soundId, const juce::File& savedFile, bool markAsFavorite)
+    {
+        SoundResult matchedMeta;
+        int matchedRow = -1;
+
+        {
+            const juce::ScopedLock sl (resultsLock);
+            for (size_t i = 0; i < results.size(); ++i)
+            {
+                if (results[i].id == soundId)
+                {
+                    results[i].isDownloadingMaster = false;
+                    if (savedFile.existsAsFile())
+                        results[i].localFile = savedFile;
+                    matchedMeta = results[i];
+                    matchedRow = static_cast<int> (i);
+                    break;
+                }
+            }
+        }
+
+        if (savedFile.existsAsFile())
+        {
+            proc.updateCurrentSampleLocalFile (soundId, savedFile);
+
+            if (markAsFavorite && matchedMeta.id > 0)
+            {
+                proc.setSoundFavorite (matchedMeta, true);
+                if (proc.getCurrentSampleMeta().id == soundId)
+                    waveformDisplay.updateFavoriteState (true);
+            }
+
+            syncStateToProcessor();
+            if (matchedRow >= 0)
+                table.repaintRow (matchedRow);
+
+            statusLabel.setText ("Saved Master " + savedFile.getFileExtension().toUpperCase() + ": " + savedFile.getFileName(),
+                                 juce::dontSendNotification);
+        }
+        else
+        {
+            if (matchedRow >= 0)
+                table.repaintRow (matchedRow);
+            statusLabel.setText ("Master download failed. Check OAuth setup in (i).", juce::dontSendNotification);
         }
     }
 
 private:
+    void openInfoOverlay (bool openInSetupIfNoOAuth)
+    {
+        if (infoOverlay != nullptr)
+        {
+            infoOverlay->refreshFromProcessor (openInSetupIfNoOAuth);
+            infoOverlay->setBounds (getLocalBounds());
+            infoOverlay->setVisible (true);
+            infoOverlay->toFront (true);
+        }
+    }
+
+    int findRowBySoundId (int soundId)
+    {
+        const juce::ScopedLock sl (resultsLock);
+        for (size_t i = 0; i < results.size(); ++i)
+            if (results[i].id == soundId)
+                return static_cast<int> (i);
+        return -1;
+    }
+
     void timerCallback() override
     {
         stopTimer();
@@ -2705,9 +3248,15 @@ private:
         {
             const juce::ScopedLock sl (resultsLock);
             for (auto& r : results)
+            {
                 if (r.id == soundId)
+                {
                     r.localFile = f;
+                    r.isDownloadingMaster = false;
+                }
+            }
         }
+        proc.updateCurrentSampleLocalFile (soundId, f);
         syncStateToProcessor();
     }
 
@@ -2955,15 +3504,11 @@ private:
         if (isThreadRunning())
             stopThread (2000);
 
-        if (tokenInput.isVisible())
-            commitTokenAndHideIfValid();
-
         searchTokenSnapshot = proc.savedToken.trim();
         if (searchTokenSnapshot.isEmpty())
         {
-            isEditingToken = true;
-            updateTopBarVisibility();
-            statusLabel.setText ("Paste API Key first!", juce::dontSendNotification);
+            openInfoOverlay (true);
+            statusLabel.setText ("Please complete setup in (i) first!", juce::dontSendNotification);
             return;
         }
 
@@ -3071,29 +3616,6 @@ private:
         }
     }
 
-    void commitTokenAndHideIfValid()
-    {
-        proc.savedToken = tokenInput.getText().trim();
-        proc.saveGlobalSettings();
-
-        bool valid = (proc.savedToken.length() > 5);
-        apiStatusBadge.setConnected (valid);
-
-        if (valid)
-        {
-            isEditingToken = false;
-            updateTopBarVisibility();
-        }
-    }
-
-    void updateTopBarVisibility()
-    {
-        bool valid = (proc.savedToken.trim().length() > 5);
-        apiStatusBadge.setConnected (valid);
-        tokenInput.setVisible (!valid || isEditingToken);
-        resized();
-    }
-
     static double sliderPosToSeconds (double pos, bool& isInfinity)
     {
         if (pos >= 99.5)
@@ -3143,9 +3665,6 @@ private:
         if (isThreadRunning())
             stopThread (2000);
 
-        if (tokenInput.isVisible())
-            commitTokenAndHideIfValid();
-
         if (recordHistory)
             pushCurrentStateToHistory();
 
@@ -3169,9 +3688,8 @@ private:
 
         if (searchTokenSnapshot.isEmpty())
         {
-            isEditingToken = true;
-            updateTopBarVisibility();
-            statusLabel.setText ("Paste API Key first!", juce::dontSendNotification);
+            openInfoOverlay (true);
+            statusLabel.setText ("Please complete setup in (i) first!", juce::dontSendNotification);
             return;
         }
         if (searchQuerySnapshot.isEmpty())
@@ -3208,7 +3726,7 @@ private:
         startThread();
     }
 
-    // При перетаскивании с волны автоматически сохраняет текущий RAM-сэмпл на диск перед отдачей в Ableton
+    // При перетаскивании с волны также скачивает оригинальный мастер-файл (WAV / FLAC / AIFF)
     void startExternalDragFromWaveform()
     {
         juce::StringArray filesToDrag;
@@ -3216,19 +3734,27 @@ private:
         auto selected = table.getSelectedRows();
         if (selected.size() > 1)
         {
-            const juce::ScopedLock sl (resultsLock);
-            for (int i = 0; i < selected.size(); ++i)
+            std::vector<SoundResult> itemsToMaterialize;
             {
-                int r = selected[i];
-                if (r >= 0 && r < static_cast<int> (results.size()))
+                const juce::ScopedLock sl (resultsLock);
+                for (int i = 0; i < selected.size(); ++i)
                 {
-                    auto& item = results[static_cast<size_t> (r)];
-                    if (!item.localFile.existsAsFile())
-                        proc.materializeSoundToDisk (item);
-
-                    if (item.localFile.existsAsFile())
-                        filesToDrag.addIfNotAlreadyThere (item.localFile.getFullPathName());
+                    int r = selected[i];
+                    if (r >= 0 && r < static_cast<int> (results.size()))
+                        itemsToMaterialize.push_back (results[static_cast<size_t> (r)]);
                 }
+            }
+
+            for (auto& item : itemsToMaterialize)
+            {
+                if (!item.localFile.existsAsFile())
+                {
+                    auto saved = proc.downloadMasterFileSync (item);
+                    if (saved.existsAsFile())
+                        updateRowLocalFile (item.id, saved);
+                }
+                if (item.localFile.existsAsFile())
+                    filesToDrag.addIfNotAlreadyThere (item.localFile.getFullPathName());
             }
         }
 
@@ -3237,19 +3763,26 @@ private:
             auto curMeta = proc.getCurrentSampleMeta();
             if (curMeta.id > 0)
             {
-                auto saved = proc.materializeSoundToDisk (curMeta);
-                if (saved.existsAsFile())
+                if (!curMeta.localFile.existsAsFile())
                 {
-                    updateRowLocalFile (curMeta.id, saved);
-                    filesToDrag.add (saved.getFullPathName());
+                    statusLabel.setText ("Downloading Master " + curMeta.formatType.toUpperCase() + " for DAW...", juce::dontSendNotification);
+                    auto saved = proc.downloadMasterFileSync (curMeta);
+                    if (saved.existsAsFile())
+                        updateRowLocalFile (curMeta.id, saved);
                 }
+
+                if (curMeta.localFile.existsAsFile())
+                    filesToDrag.add (curMeta.localFile.getFullPathName());
             }
         }
 
         table.repaint();
 
         if (!filesToDrag.isEmpty())
+        {
+            statusLabel.setText ("Dragging master audio to Ableton!", juce::dontSendNotification);
             performExternalDragDropOfFiles (filesToDrag, false);
+        }
     }
 
     void refreshWaveformFromProcessor()
@@ -3261,9 +3794,11 @@ private:
         waveformDisplay.setWaveformData (temp, meta.name, meta.detectedBpmKey, isFav, (int) proc.getPlaybackMode());
     }
 
-    // Запускает прослушивание: если файл уже на диске — с диска, если в RAM-кэше — из памяти, иначе качает в RAM
+    // Быстрое переключение превью с немедленным сбросом устаревших потоков и запуском Lookahead
     void triggerPreviewInRamOrPlay (int index)
     {
+        uint64_t myGen = ++previewRequestGeneration;
+
         SoundResult item;
         {
             const juce::ScopedLock sl (resultsLock);
@@ -3283,7 +3818,10 @@ private:
             syncStateToProcessor();
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
-            statusLabel.setText ("Playing from disk. Drag to Ableton!", juce::dontSendNotification);
+            statusLabel.setText ("Playing Master " + item.localFile.getFileExtension().toUpperCase() + " from disk.", juce::dontSendNotification);
+
+            prefetchRowIntoRamAsync (index + 1, myGen);
+            prefetchRowIntoRamAsync (index + 2, myGen);
             return;
         }
 
@@ -3299,26 +3837,153 @@ private:
             syncStateToProcessor();
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
-            statusLabel.setText ("RAM Preview (Disk clean). Click 'Get' or Drag to save.", juce::dontSendNotification);
+            statusLabel.setText ("Instant RAM Preview (" + item.formatType.toUpperCase() + " master ready on 'Get' or Drag)",
+                                 juce::dontSendNotification);
+
+            prefetchRowIntoRamAsync (index + 1, myGen);
+            prefetchRowIntoRamAsync (index + 2, myGen);
             return;
         }
 
-        fetchSoundAsync (index, true, false);
+        streamPreviewToRamWithCancellation (index, myGen);
     }
 
-    void ensureRowInRamQuietly (int index)
+    // Потоковая подгрузка превью в RAM по 16 КБ с мгновенным обрывом, если пользователь переключил звук
+    void streamPreviewToRamWithCancellation (int index, uint64_t requestGen)
     {
-        SoundResult item;
+        statusLabel.setText ("Streaming preview to RAM...", juce::dontSendNotification);
+
+        juce::String previewUrl;
+        int soundId = 0;
+
         {
             const juce::ScopedLock sl (resultsLock);
             if (index < 0 || index >= static_cast<int> (results.size()))
                 return;
-            item = results[static_cast<size_t> (index)];
+            previewUrl = results[static_cast<size_t> (index)].previewUrl;
+            soundId = results[static_cast<size_t> (index)].id;
+        }
+
+        if (previewUrl.isEmpty() || soundId <= 0)
+            return;
+
+        juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
+
+        juce::Thread::launch ([safeThis, soundId, previewUrl, requestGen]() {
+            juce::MemoryBlock mb;
+
+            juce::URL url (previewUrl);
+            auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                               .withConnectionTimeoutMs (8000);
+
+            if (auto stream = url.createInputStream (options))
+            {
+                char buffer[16384];
+                while (!stream->isExhausted())
+                {
+                    if (safeThis == nullptr || safeThis->previewRequestGeneration.load() != requestGen)
+                        return; // Мгновенно обрываем скачивание пропущенного сэмпла!
+
+                    int bytesRead = stream->read (buffer, sizeof (buffer));
+                    if (bytesRead <= 0)
+                        break;
+                    mb.append (buffer, (size_t) bytesRead);
+                }
+            }
+
+            juce::MessageManager::callAsync ([safeThis, soundId, mb, requestGen]() {
+                if (safeThis != nullptr)
+                    safeThis->finishRamPreviewFetch (soundId, mb, requestGen);
+            });
+        });
+    }
+
+    // Тихий фоновый прогрев следующих строк в RAM (Lookahead)
+    void prefetchRowIntoRamAsync (int index, uint64_t expectedGen)
+    {
+        juce::String previewUrl;
+        int soundId = 0;
+
+        {
+            const juce::ScopedLock sl (resultsLock);
+            if (index < 0 || index >= static_cast<int> (results.size()))
+                return;
+            const auto& item = results[static_cast<size_t> (index)];
+            if (item.localFile.existsAsFile())
+                return;
+            previewUrl = item.previewUrl;
+            soundId = item.id;
         }
 
         juce::MemoryBlock dummy;
-        if (!item.localFile.existsAsFile() && !proc.getRamCachedMp3 (item.id, dummy))
-            fetchSoundAsync (index, false, false);
+        if (soundId <= 0 || previewUrl.isEmpty() || proc.getRamCachedMp3 (soundId, dummy))
+            return;
+
+        juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
+
+        juce::Thread::launch ([safeThis, soundId, previewUrl, expectedGen]() {
+            if (safeThis == nullptr || safeThis->previewRequestGeneration.load() != expectedGen)
+                return;
+
+            juce::MemoryBlock mb;
+            juce::URL url (previewUrl);
+            auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                               .withConnectionTimeoutMs (8000);
+
+            if (auto stream = url.createInputStream (options))
+            {
+                char buffer[16384];
+                while (!stream->isExhausted())
+                {
+                    if (safeThis == nullptr || safeThis->previewRequestGeneration.load() != expectedGen)
+                        return;
+
+                    int bytesRead = stream->read (buffer, sizeof (buffer));
+                    if (bytesRead <= 0)
+                        break;
+                    mb.append (buffer, (size_t) bytesRead);
+                }
+            }
+
+            if (mb.getSize() > 0 && safeThis != nullptr)
+                safeThis->proc.storeRamCachedMp3 (soundId, mb);
+        });
+    }
+
+    // Асинхронная загрузка оригинального мастер-файла (по клику на Get, Heart или при мультивыборе)
+    void triggerMasterDownloadAsync (int rowIndex, bool markAsFavorite)
+    {
+        SoundResult itemCopy;
+        {
+            const juce::ScopedLock sl (resultsLock);
+            if (rowIndex < 0 || rowIndex >= static_cast<int> (results.size()))
+                return;
+            if (results[static_cast<size_t> (rowIndex)].localFile.existsAsFile()
+                || results[static_cast<size_t> (rowIndex)].isDownloadingMaster)
+                return;
+
+            results[static_cast<size_t> (rowIndex)].isDownloadingMaster = true;
+            itemCopy = results[static_cast<size_t> (rowIndex)];
+        }
+
+        table.repaintRow (rowIndex);
+        statusLabel.setText ("Downloading Master " + itemCopy.formatType.toUpperCase() + ": " + itemCopy.name + "...",
+                             juce::dontSendNotification);
+
+        juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
+
+        juce::Thread::launch ([safeThis, itemCopy, markAsFavorite]() mutable {
+            if (safeThis == nullptr)
+                return;
+
+            auto savedFile = safeThis->proc.downloadMasterFileSync (itemCopy);
+            int sid = itemCopy.id;
+
+            juce::MessageManager::callAsync ([safeThis, sid, savedFile, markAsFavorite]() {
+                if (safeThis != nullptr)
+                    safeThis->finishMasterDownload (sid, savedFile, markAsFavorite);
+            });
+        });
     }
 
     void parseJsonIntoList (const juce::var& resultsVar, std::vector<SoundResult>& outList)
@@ -3356,16 +4021,7 @@ private:
                     r.previewUrl = prev->getProperty ("preview-lq-mp3").toString();
             }
 
-            auto target = proc.getSampleFileFor (r.id, r.name);
-            if (target.existsAsFile())
-                r.localFile = target;
-            else
-            {
-                auto favCopy = proc.getFavoriteFileFor (r.id, r.name);
-                if (favCopy.existsAsFile())
-                    r.localFile = favCopy;
-            }
-
+            r.localFile = proc.findExistingLocalFile (r.id, r.name, r.formatType);
             outList.push_back (r);
         }
     }
@@ -3463,59 +4119,7 @@ private:
         juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
         juce::MessageManager::callAsync ([safeThis]() {
             if (safeThis != nullptr)
-                safeThis->applyStatusMessage ("No more results or check API Key.");
-        });
-    }
-
-    // Скачивает сэмпл в RAM (или сразу на диск, если saveToDisk == true)
-    void fetchSoundAsync (int index, bool shouldAutoPlay, bool saveToDisk)
-    {
-        if (shouldAutoPlay)
-            statusLabel.setText (saveToDisk ? "Saving to disk..." : "Streaming preview to RAM...", juce::dontSendNotification);
-
-        juce::String previewUrl;
-        juce::String name;
-        int soundId = 0;
-
-        {
-            const juce::ScopedLock sl (resultsLock);
-            if (index < 0 || index >= static_cast<int> (results.size()))
-                return;
-            previewUrl = results[static_cast<size_t> (index)].previewUrl;
-            name = results[static_cast<size_t> (index)].name;
-            soundId = results[static_cast<size_t> (index)].id;
-        }
-
-        auto targetDir = proc.sampleDirectory;
-        juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
-
-        juce::Thread::launch ([safeThis, soundId, previewUrl, name, targetDir, shouldAutoPlay, saveToDisk]() {
-            juce::MemoryBlock mb;
-            juce::File savedFile;
-
-            if (previewUrl.isNotEmpty())
-            {
-                juce::URL url (previewUrl);
-                auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
-                                   .withConnectionTimeoutMs (12000);
-
-                if (auto stream = url.createInputStream (options))
-                    stream->readIntoMemoryBlock (mb);
-            }
-
-            if (saveToDisk && mb.getSize() > 0)
-            {
-                targetDir.createDirectory();
-                auto sanitized = juce::File::createLegalFileName (name);
-                auto local = targetDir.getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
-                if (local.replaceWithData (mb.getData(), mb.getSize()))
-                    savedFile = local;
-            }
-
-            juce::MessageManager::callAsync ([safeThis, soundId, mb, savedFile, shouldAutoPlay]() {
-                if (safeThis != nullptr)
-                    safeThis->finishFetchForSound (soundId, mb, savedFile, shouldAutoPlay);
-            });
+                safeThis->applyStatusMessage ("No more results or check credentials in (i).");
         });
     }
 
@@ -3523,8 +4127,6 @@ private:
     ModernLookAndFeel modernLF;
 
     ApiStatusBadge apiStatusBadge;
-    juce::TextEditor tokenInput;
-    bool isEditingToken = true;
 
     IconButton backHistoryButton { IconButton::BackArrow };
     juce::TextEditor searchInput;
@@ -3560,6 +4162,8 @@ private:
 
     SoundResult pinnedReferenceSound;
     bool hasPinnedReference = false;
+
+    std::atomic<uint64_t> previewRequestGeneration { 0 };
 
     juce::String searchTokenSnapshot;
     juce::String searchQuerySnapshot;
