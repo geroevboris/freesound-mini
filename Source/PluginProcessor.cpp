@@ -193,6 +193,73 @@ public:
         return getFavoritesDirectory().getChildFile ("favorites_index.xml");
     }
 
+    juce::File getSampleFileFor (int soundId, const juce::String& name) const
+    {
+        auto sanitized = juce::File::createLegalFileName (name);
+        return sampleDirectory.getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+    }
+
+    juce::File getFavoriteFileFor (int soundId, const juce::String& name) const
+    {
+        auto sanitized = juce::File::createLegalFileName (name);
+        return getFavoritesDirectory().getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+    }
+
+    void storeRamCachedMp3 (int soundId, const juce::MemoryBlock& mb)
+    {
+        if (soundId <= 0 || mb.getSize() == 0)
+            return;
+
+        const juce::ScopedLock sl (ramCacheLock);
+        if (ramMp3Cache.size() >= 45 && ramMp3Cache.find (soundId) == ramMp3Cache.end())
+            ramMp3Cache.erase (ramMp3Cache.begin());
+
+        ramMp3Cache[soundId] = mb;
+    }
+
+    bool getRamCachedMp3 (int soundId, juce::MemoryBlock& outBlock) const
+    {
+        const juce::ScopedLock sl (ramCacheLock);
+        auto it = ramMp3Cache.find (soundId);
+        if (it != ramMp3Cache.end() && it->second.getSize() > 0)
+        {
+            outBlock = it->second;
+            return true;
+        }
+        return false;
+    }
+
+    // Мгновенно материализует сэмпл из RAM-кэша на диск (при нажатии Get, Сердечка или при Drag-and-Drop)
+    juce::File materializeSoundToDisk (SoundResult& sound)
+    {
+        if (sound.id <= 0)
+            return {};
+
+        auto target = getSampleFileFor (sound.id, sound.name);
+        if (target.existsAsFile())
+        {
+            sound.localFile = target;
+            if (currentSampleMeta.id == sound.id)
+                currentSampleMeta.localFile = target;
+            return target;
+        }
+
+        juce::MemoryBlock mb;
+        if (getRamCachedMp3 (sound.id, mb))
+        {
+            sampleDirectory.createDirectory();
+            if (target.replaceWithData (mb.getData(), mb.getSize()))
+            {
+                sound.localFile = target;
+                if (currentSampleMeta.id == sound.id)
+                    currentSampleMeta.localFile = target;
+                return target;
+            }
+        }
+
+        return {};
+    }
+
     void saveGlobalSettings()
     {
         juce::ValueTree tree ("FreesoundMiniGlobalSettings");
@@ -256,11 +323,21 @@ public:
 
         auto fPath = c.getProperty ("localFile", "").toString();
         if (fPath.isNotEmpty())
-            r.localFile = juce::File (fPath);
+        {
+            juce::File f (fPath);
+            if (f.existsAsFile())
+                r.localFile = f;
+        }
 
-        auto favCopy = getFavoriteFileFor (r.id, r.name);
-        if (!r.localFile.existsAsFile() && favCopy.existsAsFile())
-            r.localFile = favCopy;
+        if (!r.localFile.existsAsFile())
+        {
+            auto sampleFile = getSampleFileFor (r.id, r.name);
+            auto favCopy = getFavoriteFileFor (r.id, r.name);
+            if (sampleFile.existsAsFile())
+                r.localFile = sampleFile;
+            else if (favCopy.existsAsFile())
+                r.localFile = favCopy;
+        }
 
         r.username = c.getProperty ("username", "").toString();
         r.packName = c.getProperty ("packName", "").toString();
@@ -311,12 +388,6 @@ public:
         }
     }
 
-    juce::File getFavoriteFileFor (int soundId, const juce::String& name) const
-    {
-        auto sanitized = juce::File::createLegalFileName (name);
-        return getFavoritesDirectory().getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
-    }
-
     bool isSoundFavorite (int soundId) const
     {
         const juce::ScopedLock sl (favLock);
@@ -326,7 +397,7 @@ public:
         return false;
     }
 
-    void setSoundFavorite (const SoundResult& sound, bool shouldBeFav)
+    void setSoundFavorite (SoundResult& sound, bool shouldBeFav)
     {
         auto favFile = getFavoriteFileFor (sound.id, sound.name);
         {
@@ -337,6 +408,9 @@ public:
 
             if (shouldBeFav)
             {
+                if (!sound.localFile.existsAsFile())
+                    materializeSoundToDisk (sound);
+
                 SoundResult copy = sound;
                 copy.isPinnedRef = false;
                 if (sound.localFile.existsAsFile())
@@ -467,9 +541,11 @@ public:
             loadGlobalSettings();
     }
 
-    juce::String loadAndPlayFile (const juce::File& file, const SoundResult& meta, bool resetPitchToZero)
+    juce::String loadAndPlayFromReader (std::unique_ptr<juce::AudioFormatReader> reader,
+                                        const SoundResult& meta,
+                                        bool resetPitchToZero)
     {
-        if (!file.existsAsFile())
+        if (reader == nullptr)
             return {};
 
         if (resetPitchToZero)
@@ -477,43 +553,59 @@ public:
 
         transportSource.stop();
         transportSource.setSource (nullptr);
-        currentFile = file;
         currentSampleMeta = meta;
-        currentSampleMeta.localFile = file;
 
         juce::String badgeText;
+        int numCh = (int) reader->numChannels;
+        int numSamples = (int) reader->lengthInSamples;
 
-        if (std::unique_ptr<juce::AudioFormatReader> tempReader { formatManager.createReaderFor (file) })
+        if (numCh > 0 && numSamples > 0)
         {
-            int numCh = (int) tempReader->numChannels;
-            int numSamples = (int) tempReader->lengthInSamples;
+            juce::AudioBuffer<float> tempBuf (numCh, numSamples);
+            reader->read (&tempBuf, 0, numSamples, 0, true, true);
 
-            if (numCh > 0 && numSamples > 0)
-            {
-                juce::AudioBuffer<float> tempBuf (numCh, numSamples);
-                tempReader->read (&tempBuf, 0, numSamples, 0, true, true);
+            float peak = 0.0f;
+            for (int ch = 0; ch < numCh; ++ch)
+                peak = std::max (peak, tempBuf.getMagnitude (ch, 0, numSamples));
 
-                float peak = 0.0f;
-                for (int ch = 0; ch < numCh; ++ch)
-                    peak = std::max (peak, tempBuf.getMagnitude (ch, 0, numSamples));
+            loadedFilePeak = (peak > 0.0001f) ? peak : 1.0f;
+            originalFileSampleRate = reader->sampleRate;
 
-                loadedFilePeak = (peak > 0.0001f) ? peak : 1.0f;
-                originalFileSampleRate = tempReader->sampleRate;
+            badgeText = analyzeAudioMusicalBadge (tempBuf, originalFileSampleRate, meta);
+            currentSampleMeta.detectedBpmKey = badgeText;
 
-                badgeText = analyzeAudioMusicalBadge (tempBuf, originalFileSampleRate, meta);
-                currentSampleMeta.detectedBpmKey = badgeText;
+            memorySource->setBuffer (tempBuf);
+            memorySource->setReversed (playbackMode == ModeReverse);
+            memorySource->setLoopingMode (playbackMode == ModeLoop);
 
-                memorySource->setBuffer (tempBuf);
-                memorySource->setReversed (playbackMode == ModeReverse);
-                memorySource->setLoopingMode (playbackMode == ModeLoop);
-
-                const juce::ScopedLock sl (bufferLock);
-                cachedBuffer = std::move (tempBuf);
-            }
+            const juce::ScopedLock sl (bufferLock);
+            cachedBuffer = std::move (tempBuf);
         }
 
         rebuildTransport (0.0, true);
         return badgeText;
+    }
+
+    juce::String loadAndPlayFile (const juce::File& file, const SoundResult& meta, bool resetPitchToZero)
+    {
+        if (!file.existsAsFile())
+            return {};
+
+        std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
+        SoundResult updatedMeta = meta;
+        updatedMeta.localFile = file;
+        return loadAndPlayFromReader (std::move (reader), updatedMeta, resetPitchToZero);
+    }
+
+    // Загрузка и проигрывание напрямую из оперативной памяти (без записи файла на диск)
+    juce::String loadAndPlayMemoryBlock (const juce::MemoryBlock& mb, const SoundResult& meta, bool resetPitchToZero)
+    {
+        if (mb.getSize() == 0)
+            return {};
+
+        auto memStream = std::make_unique<juce::MemoryInputStream> (mb, false);
+        std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (std::move (memStream)));
+        return loadAndPlayFromReader (std::move (reader), meta, resetPitchToZero);
     }
 
     void rebuildTransport (double startPosSeconds, bool autoStart)
@@ -573,9 +665,9 @@ public:
 
             transportSource.start();
         }
-        else if (currentFile.existsAsFile())
+        else if (currentSampleMeta.localFile.existsAsFile())
         {
-            loadAndPlayFile (currentFile, currentSampleMeta, false);
+            loadAndPlayFile (currentSampleMeta.localFile, currentSampleMeta, false);
         }
     }
 
@@ -641,7 +733,6 @@ public:
         dest.makeCopyOf (cachedBuffer);
     }
 
-    juce::File getCurrentFile() const { return currentFile; }
     SoundResult getCurrentSampleMeta() const { return currentSampleMeta; }
 
     juce::String savedToken;
@@ -826,10 +917,12 @@ private:
     double originalFileSampleRate = 44100.0;
     PlaybackMode playbackMode = ModeNormal;
 
-    juce::File currentFile;
     SoundResult currentSampleMeta;
     juce::CriticalSection bufferLock;
     juce::AudioBuffer<float> cachedBuffer;
+
+    mutable juce::CriticalSection ramCacheLock;
+    std::map<int, juce::MemoryBlock> ramMp3Cache;
 
     mutable juce::CriticalSection favLock;
     std::vector<SoundResult> favoriteItems;
@@ -943,10 +1036,135 @@ private:
 };
 
 //==============================================================================
+// Сдвоенный блок управления папкой [ Выбрать папку | Открыть в Finder ] под единой рамкой
+class SegmentedFolderControl : public juce::Component
+{
+public:
+    std::function<void()> onChooseFolder;
+    std::function<void()> onOpenFolder;
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        int newHalf = (e.x < getWidth() / 2) ? 1 : 2;
+        if (hoveredHalf != newHalf)
+        {
+            hoveredHalf = newHalf;
+            repaint();
+        }
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        hoveredHalf = 0;
+        pressedHalf = 0;
+        repaint();
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        pressedHalf = (e.x < getWidth() / 2) ? 1 : 2;
+        repaint();
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        int releasedHalf = (e.x < getWidth() / 2) ? 1 : 2;
+        if (pressedHalf == releasedHalf && getLocalBounds().contains (e.getPosition()))
+        {
+            if (releasedHalf == 1 && onChooseFolder)
+                onChooseFolder();
+            else if (releasedHalf == 2 && onOpenFolder)
+                onOpenFolder();
+        }
+        pressedHalf = 0;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto b = getLocalBounds().toFloat().reduced (1.0f);
+        float midX = b.getCentreX();
+
+        g.setColour (juce::Colour (0xff16181d));
+        g.fillRoundedRectangle (b, 7.0f);
+
+        if (hoveredHalf == 1)
+        {
+            juce::Graphics::ScopedSaveState ss (g);
+            g.reduceClipRegion (0, 0, getWidth() / 2, getHeight());
+            g.setColour (pressedHalf == 1 ? juce::Colour (0xff24332c) : juce::Colour (0xff1e2229));
+            g.fillRoundedRectangle (b, 7.0f);
+        }
+        else if (hoveredHalf == 2)
+        {
+            juce::Graphics::ScopedSaveState ss (g);
+            g.reduceClipRegion (getWidth() / 2, 0, getWidth() - getWidth() / 2, getHeight());
+            g.setColour (pressedHalf == 2 ? juce::Colour (0xff24332c) : juce::Colour (0xff1e2229));
+            g.fillRoundedRectangle (b, 7.0f);
+        }
+
+        g.setColour (hoveredHalf != 0 ? juce::Colour (0xff52b788).withAlpha (0.55f) : juce::Colour (0xff262930));
+        g.drawRoundedRectangle (b, 7.0f, 1.0f);
+
+        g.setColour (juce::Colour (0xff262930));
+        g.drawVerticalLine ((int) std::round (midX), b.getY() + 4.0f, b.getBottom() - 4.0f);
+
+        // Левая половина: Иконка папки
+        {
+            float cx = b.getX() + b.getWidth() * 0.25f;
+            float cy = b.getCentreY();
+            float s = b.getHeight() * 0.27f;
+
+            juce::Colour col = (pressedHalf == 1) ? juce::Colour (0xff52b788)
+                             : (hoveredHalf == 1 ? juce::Colour (0xff74c69d) : juce::Colours::lightgrey);
+            g.setColour (col);
+
+            juce::Path p;
+            p.startNewSubPath (cx - s * 1.1f, cy - s * 0.7f);
+            p.lineTo (cx - s * 0.2f, cy - s * 0.7f);
+            p.lineTo (cx + s * 0.1f, cy - s * 0.35f);
+            p.lineTo (cx + s * 1.1f, cy - s * 0.35f);
+            p.lineTo (cx + s * 1.1f, cy + s * 0.8f);
+            p.lineTo (cx - s * 1.1f, cy + s * 0.8f);
+            p.closeSubPath();
+            g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+
+        // Правая половина: Иконка открытия в Finder
+        {
+            float cx = b.getX() + b.getWidth() * 0.75f;
+            float cy = b.getCentreY();
+            float s = b.getHeight() * 0.27f;
+
+            juce::Colour col = (pressedHalf == 2) ? juce::Colour (0xff52b788)
+                             : (hoveredHalf == 2 ? juce::Colour (0xff74c69d) : juce::Colours::lightgrey);
+            g.setColour (col);
+
+            juce::Path p;
+            p.startNewSubPath (cx + s * 0.1f, cy - s * 0.8f);
+            p.lineTo (cx + s * 0.9f, cy - s * 0.8f);
+            p.lineTo (cx + s * 0.9f, cy);
+            p.startNewSubPath (cx + s * 0.9f, cy - s * 0.8f);
+            p.lineTo (cx - s * 0.3f, cy + s * 0.4f);
+            p.startNewSubPath (cx, cy - s * 0.5f);
+            p.lineTo (cx - s * 0.8f, cy - s * 0.5f);
+            p.lineTo (cx - s * 0.8f, cy + s * 0.8f);
+            p.lineTo (cx + s * 0.5f, cy + s * 0.8f);
+            p.lineTo (cx + s * 0.5f, cy + s * 0.1f);
+            g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+    }
+
+private:
+    int hoveredHalf = 0;
+    int pressedHalf = 0;
+};
+
+//==============================================================================
 class IconButton : public juce::Button
 {
 public:
-    enum Type { PlayPause, Stop, Search, Dice2D, HashTag, Heart, BackArrow, ModeCycle, Folder, OpenExternal, Info, Close };
+    enum Type { PlayPause, Stop, Dice2D, HashTag, Heart, BackArrow, ModeCycle, Info, Close };
 
     explicit IconButton (Type t, bool noBorder = false)
         : juce::Button (""), iconType (t), frameless (noBorder) {}
@@ -1040,13 +1258,6 @@ public:
                 g.fillRoundedRectangle (cx - s * 0.82f, cy - s * 0.82f, s * 1.64f, s * 1.64f, 2.0f);
                 break;
 
-            case Search:
-                p.addEllipse (cx - s * 0.9f, cy - s * 0.9f, s * 1.4f, s * 1.4f);
-                p.startNewSubPath (cx + s * 0.3f, cy + s * 0.3f);
-                p.lineTo (cx + s * 1.0f, cy + s * 1.0f);
-                g.strokePath (p, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-                break;
-
             case BackArrow:
                 p.startNewSubPath (cx + s * 0.8f, cy);
                 p.lineTo (cx - s * 0.8f, cy);
@@ -1117,31 +1328,6 @@ public:
                 break;
             }
 
-            case Folder:
-                p.startNewSubPath (cx - s * 1.1f, cy - s * 0.7f);
-                p.lineTo (cx - s * 0.2f, cy - s * 0.7f);
-                p.lineTo (cx + s * 0.1f, cy - s * 0.35f);
-                p.lineTo (cx + s * 1.1f, cy - s * 0.35f);
-                p.lineTo (cx + s * 1.1f, cy + s * 0.8f);
-                p.lineTo (cx - s * 1.1f, cy + s * 0.8f);
-                p.closeSubPath();
-                g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-                break;
-
-            case OpenExternal:
-                p.startNewSubPath (cx + s * 0.1f, cy - s * 0.8f);
-                p.lineTo (cx + s * 0.9f, cy - s * 0.8f);
-                p.lineTo (cx + s * 0.9f, cy);
-                p.startNewSubPath (cx + s * 0.9f, cy - s * 0.8f);
-                p.lineTo (cx - s * 0.3f, cy + s * 0.4f);
-                p.startNewSubPath (cx, cy - s * 0.5f);
-                p.lineTo (cx - s * 0.8f, cy - s * 0.5f);
-                p.lineTo (cx - s * 0.8f, cy + s * 0.8f);
-                p.lineTo (cx + s * 0.5f, cy + s * 0.8f);
-                p.lineTo (cx + s * 0.5f, cy + s * 0.1f);
-                g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-                break;
-
             case Info:
                 g.drawEllipse (cx - s, cy - s, s * 2.0f, s * 2.0f, 1.5f);
                 g.fillEllipse (cx - 1.2f, cy - s * 0.55f, 2.4f, 2.4f);
@@ -1169,7 +1355,6 @@ private:
 };
 
 //==============================================================================
-// Компактная карточка паспорта сэмпла (в 1.5 раза меньше, без стрелочки)
 class SamplePassportPopup : public juce::Component
 {
 public:
@@ -1683,7 +1868,6 @@ public:
         LookAndFeel_V4::drawLinearSlider (g, x, y, width, height, sliderPos, minSliderPos, maxSliderPos, style, slider);
     }
 
-    // Чистая плоская карточка для CallOutBox без комиксной стрелочки
     void drawCallOutBoxBackground (juce::CallOutBox& box, juce::Graphics& g,
                                    const juce::Path&, juce::Image&) override
     {
@@ -1744,13 +1928,13 @@ public:
         area.removeFromTop (6);
 
         juce::String text =
-            "2. Waveform Playback Modes (Top-Left Icon):\n"
-            "   Click to cycle: Normal (->), Reverse (<-), and Loop.\n\n"
+            "2. Clean Disk & RAM Preview:\n"
+            "   Clicking any row previews audio in RAM without cluttering your disk.\n"
+            "   Files save to disk ONLY when you click 'Get', Heart, or Drag to Ableton.\n\n"
             "3. Transport & Shortcuts:\n"
-            "   Single Spacebar: Play / Pause. Double Spacebar: Stop & Reset.\n"
-            "   Up / Down Arrows: Navigate & auto-preview sounds.\n\n"
-            "4. Right-Click Menu & Reference Pinning:\n"
-            "   Right-click any row for Show Similar (pins [REF] at top) or Open in Browser.";
+            "   Single Space: Play/Pause. Double Space: Stop. Up/Down: Navigate.\n\n"
+            "4. Right-Click Menu:\n"
+            "   Right-click any row for Show Similar (pins [REF]) or Open in Browser.";
 
         g.drawFittedText (text, area, juce::Justification::topLeft, 20);
     }
@@ -1807,7 +1991,8 @@ public:
         };
         addAndMakeVisible (apiStatusBadge);
 
-        dirButton.onClick = [this] {
+        // Сдвоенный блок [ Выбрать папку | Открыть в Finder ]
+        folderControl.onChooseFolder = [this] {
             fileChooser = std::make_unique<juce::FileChooser> ("Choose Sample Folder",
                                                                proc.sampleDirectory,
                                                                "*");
@@ -1823,15 +2008,13 @@ public:
                 }
             });
         };
-        addAndMakeVisible (dirButton);
-
-        openFolderButton.onClick = [this] {
+        folderControl.onOpenFolder = [this] {
             if (showingFavoritesOnly)
                 proc.getFavoritesDirectory().startAsProcess();
             else
                 proc.sampleDirectory.startAsProcess();
         };
-        addAndMakeVisible (openFolderButton);
+        addAndMakeVisible (folderControl);
 
         infoButton.onClick = [this] {
             if (infoOverlay != nullptr)
@@ -1847,8 +2030,8 @@ public:
         backHistoryButton.setEnabled (!proc.searchHistory.empty());
         addAndMakeVisible (backHistoryButton);
 
-        // Идеально выровненный по вертикали текст в поле поиска с правым отступом под кнопку '#'
-        searchInput.setTextToShowWhenEmpty ("Search sounds (808, vinyl, bowl)...", juce::Colours::grey);
+        // Поле поиска (поиск по Enter, без лишней кнопки лупы)
+        searchInput.setTextToShowWhenEmpty ("Search sounds (press Enter)...", juce::Colours::grey);
         searchInput.setJustification (juce::Justification::centredLeft);
         searchInput.setIndents (6, 4);
         searchInput.setBorder (juce::BorderSize<int> (1, 6, 1, 28));
@@ -1858,9 +2041,6 @@ public:
 
         tagMenuButton.onClick = [this] { showCuratedTagsMenu(); };
         addAndMakeVisible (tagMenuButton);
-
-        searchButton.onClick = [this] { startNewSearch (true); };
-        addAndMakeVisible (searchButton);
 
         randomDiceButton.onClick = [this] { startPureRandomSearch(); };
         addAndMakeVisible (randomDiceButton);
@@ -1948,6 +2128,10 @@ public:
             {
                 bool nowFav = !proc.isSoundFavorite (cur.id);
                 proc.setSoundFavorite (cur, nowFav);
+
+                if (cur.localFile.existsAsFile())
+                    updateRowLocalFile (cur.id, cur.localFile);
+
                 waveformDisplay.updateFavoriteState (nowFav);
                 table.repaint();
             }
@@ -2084,12 +2268,11 @@ public:
     {
         auto area = getLocalBounds().reduced (12);
 
+        // Верхняя шапка: Статус API слева, сдвоенный блок [ Папка | Открыть ] + (i) справа
         auto topBar = area.removeFromTop (28);
         infoButton.setBounds (topBar.removeFromRight (28));
-        topBar.removeFromRight (4);
-        openFolderButton.setBounds (topBar.removeFromRight (28));
-        topBar.removeFromRight (4);
-        dirButton.setBounds (topBar.removeFromRight (28));
+        topBar.removeFromRight (5);
+        folderControl.setBounds (topBar.removeFromRight (56));
         topBar.removeFromRight (6);
 
         if (tokenInput.isVisible())
@@ -2105,12 +2288,11 @@ public:
 
         area.removeFromTop (8);
 
+        // Строка поиска: Назад (<-) + Поле поиска (с # внутри) + Кубик + Сердце
         auto searchRow = area.removeFromTop (30);
         favFilterButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (4);
         randomDiceButton.setBounds (searchRow.removeFromRight (30));
-        searchRow.removeFromRight (4);
-        searchButton.setBounds (searchRow.removeFromRight (30));
         searchRow.removeFromRight (6);
 
         backHistoryButton.setBounds (searchRow.removeFromLeft (28));
@@ -2258,7 +2440,7 @@ public:
             else
             {
                 g.setColour (juce::Colour (0xffcca43b));
-                g.drawText ("Load", 0, 0, width, height, juce::Justification::centred);
+                g.drawText ("Get", 0, 0, width, height, juce::Justification::centred);
             }
         }
     }
@@ -2285,6 +2467,7 @@ public:
         table.repaint();
     }
 
+    // При перетаскивании из таблицы мгновенно материализует выбранные звуки из RAM-кэша на диск
     juce::var getDragSourceDescription (const juce::SparseSet<int>& currentlySelectedRows) override
     {
         juce::StringArray filesToDrag;
@@ -2296,15 +2479,18 @@ public:
                 int r = currentlySelectedRows[i];
                 if (r >= 0 && r < static_cast<int> (results.size()))
                 {
-                    auto f = results[static_cast<size_t> (r)].localFile;
-                    if (f.existsAsFile())
-                        filesToDrag.addIfNotAlreadyThere (f.getFullPathName());
+                    auto& item = results[static_cast<size_t> (r)];
+                    if (!item.localFile.existsAsFile())
+                        proc.materializeSoundToDisk (item);
+
+                    if (item.localFile.existsAsFile())
+                        filesToDrag.addIfNotAlreadyThere (item.localFile.getFullPathName());
                 }
             }
         }
 
-        if (filesToDrag.isEmpty() && proc.getCurrentFile().existsAsFile())
-            filesToDrag.add (proc.getCurrentFile().getFullPathName());
+        syncStateToProcessor();
+        table.repaint();
 
         if (!filesToDrag.isEmpty())
             performExternalDragDropOfFiles (filesToDrag, false);
@@ -2314,11 +2500,12 @@ public:
 
     void selectedRowsChanged (int lastRowSelected) override
     {
+        // При мультивыборе подгружаем превью только в RAM-кэш (диск не засоряется до реального перетаскивания)
         auto selected = table.getSelectedRows();
         if (selected.size() > 1)
         {
             for (int i = 0; i < selected.size(); ++i)
-                ensureRowDownloadedQuietly (selected[i]);
+                ensureRowInRamQuietly (selected[i]);
         }
 
         if (lastRowSelected >= 0 && lastRowSelected != lastTriggeredRow)
@@ -2326,7 +2513,7 @@ public:
             lastTriggeredRow = lastRowSelected;
             proc.persistedSelectedRow = lastRowSelected;
             pitchSlider.setValue (0.0, juce::dontSendNotification);
-            triggerLoadAndPlay (lastRowSelected);
+            triggerPreviewInRamOrPlay (lastRowSelected);
         }
     }
 
@@ -2343,7 +2530,6 @@ public:
             item = results[static_cast<size_t> (rowNumber)];
         }
 
-        // Лаконичное контекстное меню по ПКМ (без дублирующего инфо-окна)
         if (e.mods.isPopupMenu())
         {
             juce::PopupMenu m;
@@ -2360,13 +2546,16 @@ public:
             return;
         }
 
+        // Колонка 1: Сердечко (сохраняет на диск и в папку Favorites)
         if (columnId == 1)
         {
             bool makeFav = !proc.isSoundFavorite (item.id);
             proc.setSoundFavorite (item, makeFav);
 
-            if (makeFav && !item.localFile.existsAsFile())
-                ensureRowDownloadedQuietly (rowNumber);
+            if (item.localFile.existsAsFile())
+                updateRowLocalFile (item.id, item.localFile);
+            else if (makeFav)
+                fetchSoundAsync (rowNumber, false, true);
 
             if (proc.getCurrentSampleMeta().id == item.id)
                 waveformDisplay.updateFavoriteState (makeFav);
@@ -2378,12 +2567,29 @@ public:
             return;
         }
 
+        // Колонка 4 (STATUS): Явное сохранение выбранного сэмпла на диск по клику на "Get"
+        if (columnId == 4 && !item.localFile.existsAsFile())
+        {
+            auto savedFile = proc.materializeSoundToDisk (item);
+            if (savedFile.existsAsFile())
+            {
+                updateRowLocalFile (item.id, savedFile);
+                table.repaintRow (rowNumber);
+                statusLabel.setText ("Saved to disk: " + savedFile.getFileName(), juce::dontSendNotification);
+            }
+            else
+            {
+                fetchSoundAsync (rowNumber, true, true);
+            }
+            return;
+        }
+
         if (table.getNumSelectedRows() <= 1)
         {
             lastTriggeredRow = rowNumber;
             proc.persistedSelectedRow = rowNumber;
             pitchSlider.setValue (0.0, juce::dontSendNotification);
-            triggerLoadAndPlay (rowNumber);
+            triggerPreviewInRamOrPlay (rowNumber);
         }
     }
 
@@ -2420,52 +2626,70 @@ public:
         statusLabel.setText (text, juce::dontSendNotification);
     }
 
-    void finishDownloadForIndex (int soundId, const juce::File& local, bool shouldAutoPlay)
+    void finishFetchForSound (int soundId, const juce::MemoryBlock& mb, const juce::File& savedDiskFile, bool shouldAutoPlay)
     {
-        if (local.existsAsFile())
+        if (mb.getSize() == 0 && !savedDiskFile.existsAsFile())
         {
-            SoundResult matchedMeta;
-            int matchedRow = -1;
+            if (shouldAutoPlay)
+                statusLabel.setText ("Preview fetch failed.", juce::dontSendNotification);
+            return;
+        }
+
+        if (mb.getSize() > 0)
+            proc.storeRamCachedMp3 (soundId, mb);
+
+        SoundResult matchedMeta;
+        int matchedRow = -1;
+
+        {
+            const juce::ScopedLock sl (resultsLock);
+            for (size_t i = 0; i < results.size(); ++i)
+            {
+                if (results[i].id == soundId)
+                {
+                    if (savedDiskFile.existsAsFile())
+                        results[i].localFile = savedDiskFile;
+                    matchedMeta = results[i];
+                    matchedRow = static_cast<int> (i);
+                    break;
+                }
+            }
+        }
+
+        if (proc.isSoundFavorite (soundId) && matchedMeta.id > 0)
+            proc.setSoundFavorite (matchedMeta, true);
+
+        if (matchedMeta.localFile.existsAsFile() && matchedRow >= 0)
+        {
+            const juce::ScopedLock sl (resultsLock);
+            results[static_cast<size_t> (matchedRow)].localFile = matchedMeta.localFile;
+        }
+
+        syncStateToProcessor();
+
+        if (matchedRow >= 0)
+            table.repaintRow (matchedRow);
+
+        if (shouldAutoPlay && matchedMeta.id > 0)
+        {
+            juce::String badge;
+            if (matchedMeta.localFile.existsAsFile())
+                badge = proc.loadAndPlayFile (matchedMeta.localFile, matchedMeta, true);
+            else
+                badge = proc.loadAndPlayMemoryBlock (mb, matchedMeta, true);
 
             {
                 const juce::ScopedLock sl (resultsLock);
-                for (size_t i = 0; i < results.size(); ++i)
-                {
-                    if (results[i].id == soundId)
-                    {
-                        results[i].localFile = local;
-                        matchedMeta = results[i];
-                        matchedRow = static_cast<int> (i);
-                        break;
-                    }
-                }
+                if (matchedRow >= 0 && matchedRow < static_cast<int> (results.size()))
+                    results[static_cast<size_t> (matchedRow)].detectedBpmKey = badge;
             }
-
-            if (proc.isSoundFavorite (soundId) && matchedMeta.id > 0)
-                proc.setSoundFavorite (matchedMeta, true);
-
             syncStateToProcessor();
-
-            if (matchedRow >= 0)
-                table.repaintRow (matchedRow);
-
-            if (shouldAutoPlay && matchedMeta.id > 0)
-            {
-                juce::String badge = proc.loadAndPlayFile (local, matchedMeta, true);
-                {
-                    const juce::ScopedLock sl (resultsLock);
-                    if (matchedRow >= 0 && matchedRow < static_cast<int> (results.size()))
-                        results[static_cast<size_t> (matchedRow)].detectedBpmKey = badge;
-                }
-                syncStateToProcessor();
-                refreshWaveformFromProcessor();
-                playPauseButton.setActiveState (proc.isAudioPlaying());
-                statusLabel.setText ("Ready! Space: Play/Pause, 2x Space: Stop.", juce::dontSendNotification);
-            }
-        }
-        else if (shouldAutoPlay)
-        {
-            statusLabel.setText ("Download failed.", juce::dontSendNotification);
+            refreshWaveformFromProcessor();
+            playPauseButton.setActiveState (proc.isAudioPlaying());
+            statusLabel.setText (matchedMeta.localFile.existsAsFile()
+                                     ? "Saved & Playing. Drag to Ableton!"
+                                     : "RAM Preview (Disk clean). Click 'Get' or Drag to save.",
+                                 juce::dontSendNotification);
         }
     }
 
@@ -2474,6 +2698,17 @@ private:
     {
         stopTimer();
         triggerAutoSearchFromFilter();
+    }
+
+    void updateRowLocalFile (int soundId, const juce::File& f)
+    {
+        {
+            const juce::ScopedLock sl (resultsLock);
+            for (auto& r : results)
+                if (r.id == soundId)
+                    r.localFile = f;
+        }
+        syncStateToProcessor();
     }
 
     void triggerAutoSearchFromFilter()
@@ -2559,7 +2794,6 @@ private:
         statusLabel.setText ("Stepped back (" + juce::String (getNumRows()) + " sounds)", juce::dontSendNotification);
     }
 
-    // Компактный паспорт сэмпла: открывается выше волны и правее плагина, без стрелочки
     void launchFloatingSamplePopup (const SoundResult& s)
     {
         auto content = std::make_unique<SamplePassportPopup> (
@@ -2716,7 +2950,6 @@ private:
                             });
     }
 
-    // Мульти-категорийный хаотичный рандом по всей базе Freesound
     void startPureRandomSearch()
     {
         if (isThreadRunning())
@@ -2975,6 +3208,7 @@ private:
         startThread();
     }
 
+    // При перетаскивании с волны автоматически сохраняет текущий RAM-сэмпл на диск перед отдачей в Ableton
     void startExternalDragFromWaveform()
     {
         juce::StringArray filesToDrag;
@@ -2988,15 +3222,31 @@ private:
                 int r = selected[i];
                 if (r >= 0 && r < static_cast<int> (results.size()))
                 {
-                    auto f = results[static_cast<size_t> (r)].localFile;
-                    if (f.existsAsFile())
-                        filesToDrag.addIfNotAlreadyThere (f.getFullPathName());
+                    auto& item = results[static_cast<size_t> (r)];
+                    if (!item.localFile.existsAsFile())
+                        proc.materializeSoundToDisk (item);
+
+                    if (item.localFile.existsAsFile())
+                        filesToDrag.addIfNotAlreadyThere (item.localFile.getFullPathName());
                 }
             }
         }
 
-        if (filesToDrag.isEmpty() && proc.getCurrentFile().existsAsFile())
-            filesToDrag.add (proc.getCurrentFile().getFullPathName());
+        if (filesToDrag.isEmpty())
+        {
+            auto curMeta = proc.getCurrentSampleMeta();
+            if (curMeta.id > 0)
+            {
+                auto saved = proc.materializeSoundToDisk (curMeta);
+                if (saved.existsAsFile())
+                {
+                    updateRowLocalFile (curMeta.id, saved);
+                    filesToDrag.add (saved.getFullPathName());
+                }
+            }
+        }
+
+        table.repaint();
 
         if (!filesToDrag.isEmpty())
             performExternalDragDropOfFiles (filesToDrag, false);
@@ -3011,7 +3261,8 @@ private:
         waveformDisplay.setWaveformData (temp, meta.name, meta.detectedBpmKey, isFav, (int) proc.getPlaybackMode());
     }
 
-    void triggerLoadAndPlay (int index)
+    // Запускает прослушивание: если файл уже на диске — с диска, если в RAM-кэше — из памяти, иначе качает в RAM
+    void triggerPreviewInRamOrPlay (int index)
     {
         SoundResult item;
         {
@@ -3032,15 +3283,30 @@ private:
             syncStateToProcessor();
             refreshWaveformFromProcessor();
             playPauseButton.setActiveState (proc.isAudioPlaying());
-            statusLabel.setText ("Playing. Space: Play/Pause, 2x Space: Stop.", juce::dontSendNotification);
+            statusLabel.setText ("Playing from disk. Drag to Ableton!", juce::dontSendNotification);
+            return;
         }
-        else
+
+        juce::MemoryBlock cachedMb;
+        if (proc.getRamCachedMp3 (item.id, cachedMb))
         {
-            downloadSoundAtRow (index, true);
+            juce::String badge = proc.loadAndPlayMemoryBlock (cachedMb, item, true);
+            {
+                const juce::ScopedLock sl (resultsLock);
+                if (index >= 0 && index < static_cast<int> (results.size()))
+                    results[static_cast<size_t> (index)].detectedBpmKey = badge;
+            }
+            syncStateToProcessor();
+            refreshWaveformFromProcessor();
+            playPauseButton.setActiveState (proc.isAudioPlaying());
+            statusLabel.setText ("RAM Preview (Disk clean). Click 'Get' or Drag to save.", juce::dontSendNotification);
+            return;
         }
+
+        fetchSoundAsync (index, true, false);
     }
 
-    void ensureRowDownloadedQuietly (int index)
+    void ensureRowInRamQuietly (int index)
     {
         SoundResult item;
         {
@@ -3050,8 +3316,9 @@ private:
             item = results[static_cast<size_t> (index)];
         }
 
-        if (!item.localFile.existsAsFile())
-            downloadSoundAtRow (index, false);
+        juce::MemoryBlock dummy;
+        if (!item.localFile.existsAsFile() && !proc.getRamCachedMp3 (item.id, dummy))
+            fetchSoundAsync (index, false, false);
     }
 
     void parseJsonIntoList (const juce::var& resultsVar, std::vector<SoundResult>& outList)
@@ -3089,8 +3356,7 @@ private:
                     r.previewUrl = prev->getProperty ("preview-lq-mp3").toString();
             }
 
-            auto sanitizedName = juce::File::createLegalFileName (r.name);
-            auto target = proc.sampleDirectory.getChildFile (juce::String (r.id) + "_" + sanitizedName + ".mp3");
+            auto target = proc.getSampleFileFor (r.id, r.name);
             if (target.existsAsFile())
                 r.localFile = target;
             else
@@ -3201,10 +3467,11 @@ private:
         });
     }
 
-    void downloadSoundAtRow (int index, bool shouldAutoPlay)
+    // Скачивает сэмпл в RAM (или сразу на диск, если saveToDisk == true)
+    void fetchSoundAsync (int index, bool shouldAutoPlay, bool saveToDisk)
     {
         if (shouldAutoPlay)
-            statusLabel.setText ("Downloading preview...", juce::dontSendNotification);
+            statusLabel.setText (saveToDisk ? "Saving to disk..." : "Streaming preview to RAM...", juce::dontSendNotification);
 
         juce::String previewUrl;
         juce::String name;
@@ -3222,28 +3489,32 @@ private:
         auto targetDir = proc.sampleDirectory;
         juce::Component::SafePointer<FreesoundMiniEditor> safeThis (this);
 
-        juce::Thread::launch ([safeThis, soundId, previewUrl, name, targetDir, shouldAutoPlay]() {
-            auto sanitized = juce::File::createLegalFileName (name);
-            auto local = targetDir.getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+        juce::Thread::launch ([safeThis, soundId, previewUrl, name, targetDir, shouldAutoPlay, saveToDisk]() {
+            juce::MemoryBlock mb;
+            juce::File savedFile;
 
-            if (!local.existsAsFile() && previewUrl.isNotEmpty())
+            if (previewUrl.isNotEmpty())
             {
                 juce::URL url (previewUrl);
                 auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
                                    .withConnectionTimeoutMs (12000);
 
                 if (auto stream = url.createInputStream (options))
-                {
-                    juce::MemoryBlock mb;
                     stream->readIntoMemoryBlock (mb);
-                    if (mb.getSize() > 0)
-                        local.replaceWithData (mb.getData(), mb.getSize());
-                }
             }
 
-            juce::MessageManager::callAsync ([safeThis, soundId, local, shouldAutoPlay]() {
+            if (saveToDisk && mb.getSize() > 0)
+            {
+                targetDir.createDirectory();
+                auto sanitized = juce::File::createLegalFileName (name);
+                auto local = targetDir.getChildFile (juce::String (soundId) + "_" + sanitized + ".mp3");
+                if (local.replaceWithData (mb.getData(), mb.getSize()))
+                    savedFile = local;
+            }
+
+            juce::MessageManager::callAsync ([safeThis, soundId, mb, savedFile, shouldAutoPlay]() {
                 if (safeThis != nullptr)
-                    safeThis->finishDownloadForIndex (soundId, local, shouldAutoPlay);
+                    safeThis->finishFetchForSound (soundId, mb, savedFile, shouldAutoPlay);
             });
         });
     }
@@ -3258,7 +3529,6 @@ private:
     IconButton backHistoryButton { IconButton::BackArrow };
     juce::TextEditor searchInput;
     IconButton tagMenuButton     { IconButton::HashTag, true };
-    IconButton searchButton      { IconButton::Search };
     IconButton randomDiceButton  { IconButton::Dice2D };
     IconButton favFilterButton   { IconButton::Heart };
 
@@ -3267,8 +3537,7 @@ private:
     juce::Slider durRangeSlider;
     juce::Label durValueLabel;
 
-    IconButton dirButton         { IconButton::Folder };
-    IconButton openFolderButton  { IconButton::OpenExternal };
+    SegmentedFolderControl folderControl;
     IconButton infoButton        { IconButton::Info };
 
     juce::TableListBox table;
